@@ -1,0 +1,728 @@
+{
+  "version": 1,
+  "featureSlug": "init-impl",
+  "updatedAt": "2026-02-15T13:13:45.942Z",
+  "rounds": [
+    {
+      "id": "round-1",
+      "title": "Round 1",
+      "questions": [
+        {
+          "id": "r1-q1",
+          "prompt": "Which implementation stack should be primary for init-impl (core + adapters + CLI)?",
+          "options": [
+            {
+              "key": "A",
+              "text": "TypeScript + Node.js (ESM), schema validation (e.g., Zod)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Python 3.12+, Pydantic for schemas",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Go (single-binary focus)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Rust (max perf/safety, higher complexity)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T03:55:35.427Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q2",
+          "prompt": "What is the MVP entrypoint and packaging approach?",
+          "options": [
+            {
+              "key": "A",
+              "text": "CLI-first + core library module (API later)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "API server-first (HTTP) + optional CLI",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Ship both CLI and API together in MVP",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Library-only (no CLI yet)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T05:50:55.915Z",
+              "selectedKey": "C",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q3",
+          "prompt": "Where should run artifacts and evidence be stored in MVP?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Local filesystem run bundles (JSON/MD); DB later",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Postgres now (runs/evidence) + object store",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "SQLite single-file DB for runs + evidence",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "S3-compatible object store + Postgres from day one",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T05:54:32.859Z",
+              "selectedKey": "B",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q4",
+          "prompt": "Which search backend should be first-class in OSS for init-impl?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Brave Search API adapter (key-based)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "SerpAPI adapter (key-based)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "SearXNG adapter (self-hosted)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Offline-only (user supplies URLs; no web search)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T06:00:13.946Z",
+              "selectedKey": "C",
+              "notes": "C and A with C being default but configurable in the final product.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q5",
+          "prompt": "Should init-impl include Playwright browser rendering fallback?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Yes, ship Playwright renderer in MVP",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Defer; design the interface now, implement later",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Always render every page via browser",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "No browser rendering planned",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T06:00:32.227Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q6",
+          "prompt": "What should be the default citation policy mode for generated outputs?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Strict: every factual bullet must cite",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Balanced: key factual bullets cite (default)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Loose: cite only major claims",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Configurable per run/template; default Balanced",
+              "recommended": true
+            }
+          ],
+          "recommendedKey": "D",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T06:00:59.143Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q7",
+          "prompt": "How should model routing be configured for MVP?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Single model id for all phases",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Explicit model id per phase (no policy escalation)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Fully policy-based auto-routing from day one",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Phase-specific config + limited verifier escalation rules",
+              "recommended": true
+            }
+          ],
+          "recommendedKey": "D",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T06:01:08.310Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q8",
+          "prompt": "How far should caching and deterministic-ish reruns go in init-impl?",
+          "options": [
+            {
+              "key": "A",
+              "text": "No caching; rely on run bundles only",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Cache search+fetch responses on disk (keyed), with opt-out",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Cache everything including model outputs",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Determinism via fixed seed only; no cache",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T06:01:32.202Z",
+              "selectedKey": "B",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-2",
+      "title": "Round 2",
+      "questions": [
+        {
+          "id": "r2-q1",
+          "prompt": "For the API server, how should long-running research runs be executed/managed in the MVP?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Async runs executed in-process; POST returns runId; poll for status (single-node MVP)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Synchronous request: POST blocks until completion (simple but fragile)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Queue-based workers with Redis (e.g., BullMQ) from day one",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Split API + worker processes with DB-backed leasing (no Redis)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:20:52.294Z",
+              "selectedKey": "D",
+              "notes": "this should be as production grade as we can make it. so let's make sure we have the ability to recover on errors/restarts of the process and are giving meaningful status updates on each job from a status endpoint. should be able to configure how many concurrent jobs are supported (the rest are queued) and an admin interface (web or command line is fine) that lists ALL jobs and allows the admin of the system to cancel, reprioritize jobs, etc. (normal users would never see this or know it exists)",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q2",
+          "prompt": "Which Node HTTP framework should we standardize on for the MVP API server?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Fastify (TypeScript-friendly, good perf)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Express (ubiquitous, minimal)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Hono (small, modern, fetch-style)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "NestJS (opinionated, heavier)",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "tRPC-first (typed RPC, minimal REST)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:22:06.701Z",
+              "selectedKey": "A",
+              "notes": "no preference -- given my clarifications on requirements, please recommend the best option.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q3",
+          "prompt": "Which Postgres data access + migrations approach should we use for init-impl?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Drizzle ORM + drizzle-kit migrations",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Prisma + Prisma Migrate",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Kysely (typed SQL) + node-postgres + SQL migrations",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Knex.js queries + migrations",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Raw SQL only + simple migration runner",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:22:24.204Z",
+              "selectedKey": "E",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q4",
+          "prompt": "What object-store setup should init-impl target for local development (given we also run Postgres)?",
+          "options": [
+            {
+              "key": "A",
+              "text": "S3-compatible with MinIO via docker-compose (exercise S3 semantics locally)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Filesystem-only object store for dev; S3 backend later",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Dual backends: filesystem (dev) and S3 (prod); no MinIO",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "AWS S3 only (contributors must configure AWS)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:23:10.204Z",
+              "selectedKey": "A",
+              "notes": "this is likely to run on a VM. Let's not attach ourselves to any specific cloud provider.",
+              "attachments": []
+            },
+            {
+              "id": "rev-2",
+              "createdAt": "2026-02-15T12:23:26.971Z",
+              "selectedKey": "B",
+              "notes": "this is likely to run on a VM. Let's not attach ourselves to any specific cloud provider.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q5",
+          "prompt": "Search adapters: given SearXNG is default and Brave is supported/configurable, what should init-impl actually ship?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Ship SearXNG only; keep Brave as a documented interface/stub",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Ship both SearXNG + Brave adapters in MVP; selectable by config",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Ship SearXNG + Brave + manual URL list mode",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Ship Brave only; add SearXNG later",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:23:50.995Z",
+              "selectedKey": "B",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q6",
+          "prompt": "For Playwright-rendered fetches, what artifacts should be stored by default?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Rendered HTML + extracted text (no screenshot/trace by default)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Rendered HTML + extracted text + screenshot (png)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Full Playwright trace + HTML + extracted text (largest)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Extracted text only (do not store rendered HTML)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:25:46.136Z",
+              "selectedKey": "D",
+              "notes": "default to D.. but for JS heavy sites (or runs where the agent has struggled to get to the info it is searching for) do option C for troubleshooting purposes... but the user should only ever see option D.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q7",
+          "prompt": "Which output templates are required in the MVP beyond the “Research memo” template?",
+          "options": [
+            {
+              "key": "A",
+              "text": "None (Research memo only in MVP)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Add Timeline template",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Add Comparison matrix template",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Add Timeline + Comparison matrix",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Add Timeline + Matrix + Q&A template",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:26:08.565Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-3",
+      "title": "Round 3",
+      "questions": [
+        {
+          "id": "r3-q1",
+          "prompt": "How should the MVP authenticate/authorize normal user endpoints vs admin-only job controls and debug artifacts?",
+          "options": [
+            {
+              "key": "A",
+              "text": "No built-in auth; rely on network boundary/reverse proxy",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Single shared bearer token for all endpoints (user + admin)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Separate USER and ADMIN bearer tokens; admin endpoints gated",
+              "recommended": true
+            },
+            {
+              "key": "D",
+              "text": "Per-user API keys stored in Postgres + roles (admin/user)",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "External auth integration (trust proxy headers for identity/role)",
+              "recommended": false
+            },
+            {
+              "key": "F",
+              "text": "OAuth/JWT (OIDC) built-in",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "C",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:56:41.710Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            },
+            {
+              "id": "rev-2",
+              "createdAt": "2026-02-15T12:58:22.637Z",
+              "selectedKey": "D",
+              "notes": "actually YES.. this is perfect.. then we can set rate limits and quality thresholds per user. first X searches are high quality, but if that user goes beyond downgrade them to cheaper models/search harness until month end to help control costs. but do it on a per user basis so those who aren't abusing are still getting full benefit.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r3-q2",
+          "prompt": "When should the system enable Playwright debug capture (trace + rendered HTML) beyond the default extracted-text-only behavior?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Never in MVP (always text-only)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Admin-controlled per-run flag only",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Automatic heuristic only (e.g., repeated extraction failures)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Both: admin per-run flag + automatic heuristic escalation",
+              "recommended": true
+            },
+            {
+              "key": "E",
+              "text": "Always for any Playwright-rendered fetch",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "D",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:58:39.098Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r3-q3",
+          "prompt": "What should be the default retention policy for run artifacts, on-disk caches, and debug-capture traces?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Keep everything indefinitely; manual cleanup only",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "TTL for caches only; runs + debug traces kept indefinitely",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "TTL for caches + debug traces; runs kept indefinitely",
+              "recommended": true
+            },
+            {
+              "key": "D",
+              "text": "TTL for runs too (e.g., 30 days) with keep-forever option",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Minimal persistence: keep only final output + citations",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "C",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-15T12:59:10.943Z",
+              "selectedKey": "C",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-4",
+      "title": "Round 4 (complete)",
+      "questions": []
+    }
+  ],
+  "notes": ""
+}
