@@ -465,6 +465,14 @@ export class PostgresStore {
     return res.rows;
   }
 
+  async listModelCalls(runId: string): Promise<DbModelCall[]> {
+    const res = await this.pool.query<DbModelCall>(
+      `SELECT * FROM model_calls WHERE run_id = $1 ORDER BY created_at ASC`,
+      [runId]
+    );
+    return res.rows;
+  }
+
   async createJob(input: { runId: string; userId: string; priority?: number }): Promise<DbJob> {
     const res = await this.pool.query<DbJob>(
       `

@@ -181,6 +181,12 @@ class ReviewLoopModelProvider implements ModelProvider {
   readonly name = "mock-review-loop";
   public synthCallCount = 0;
   public reviewCallCount = 0;
+  public synthesisRequests: Array<{
+    refinementPass?: number;
+    hasReviewFeedback: boolean;
+    reviewFeedback?: unknown;
+    reviewStatus?: string;
+  }> = [];
 
   async chat(req: Parameters<ModelProvider["chat"]>[0]) {
     const user = req.messages.find((m) => m.role === "user")?.content ?? "";
@@ -219,6 +225,21 @@ class ReviewLoopModelProvider implements ModelProvider {
     }
 
     this.synthCallCount += 1;
+    try {
+      const requestPayload = JSON.parse(user);
+      if (requestPayload && typeof requestPayload === "object") {
+        this.synthesisRequests.push({
+          refinementPass: typeof requestPayload.refinementPass === "number" ? requestPayload.refinementPass : undefined,
+          hasReviewFeedback: !!requestPayload.reviewFeedback,
+          reviewFeedback: requestPayload.reviewFeedback,
+          reviewStatus: requestPayload.reviewStatus,
+        });
+      }
+    } catch {
+      this.synthesisRequests.push({
+        hasReviewFeedback: false,
+      });
+    }
     return {
       text: JSON.stringify({
         summary: Array.from({ length: 80 }, () =>
@@ -268,6 +289,30 @@ class ReviewLoopModelProvider implements ModelProvider {
       usage: { inputTokens: 52, outputTokens: 300, costUsd: 0.05 },
       raw: { mock: true },
     };
+  }
+}
+
+class FailingSynthesisModelProvider implements ModelProvider {
+  readonly name = "mock-failing-synthesis";
+  public requestCount = 0;
+
+  async chat(req: Parameters<ModelProvider["chat"]>[0]) {
+    this.requestCount += 1;
+    const user = req.messages.find((m) => m.role === "user")?.content ?? "";
+
+    if (user.includes("Generate a research plan")) {
+      return {
+        text: JSON.stringify({ subquestions: [], queries: ["example query"] }),
+        usage: { inputTokens: 8, outputTokens: 10, costUsd: 0.01 },
+        raw: { mock: true },
+      };
+    }
+
+    if (user.includes("keyFindings") || user.includes('"sources"')) {
+      throw new Error("Simulated provider failure during synthesis");
+    }
+
+    throw new Error(`Unhandled failing synthesis mock request: ${user.slice(0, 80)}`);
   }
 }
 
@@ -1420,10 +1465,229 @@ describe("orchestrator", () => {
 
     const events = await store!.listRunEvents(run.id, { limit: 200 });
     expect(events.find((event) => event.event_type === "synthesis_review_requested")).toBeDefined();
+    const reviewFeedbackEvents = events.filter((event) => event.event_type === "synthesis_review_feedback");
+    expect(reviewFeedbackEvents.length).toBeGreaterThanOrEqual(1);
+    const hasUnsupportedFeedback = reviewFeedbackEvents.some((event) => {
+      const data = event.data as { unsupportedConclusions?: unknown[] } | undefined;
+      return Array.isArray(data?.unsupportedConclusions) && data.unsupportedConclusions.length > 0;
+    });
+    expect(hasUnsupportedFeedback).toBe(true);
+    const firstSynthesisRequest = modelProvider.synthesisRequests.at(0);
+    const refinedSynthesisRequest = modelProvider.synthesisRequests.slice(1).find((request) => request.hasReviewFeedback);
+    expect(firstSynthesisRequest?.hasReviewFeedback).toBe(false);
+    expect(refinedSynthesisRequest).toBeDefined();
+    expect(refinedSynthesisRequest?.reviewFeedback).toMatchObject({
+      verdict: "revise",
+      unsupportedConclusions: [{ findingId: "F1" }],
+      missingEvidence: ["Need explicit mechanism evidence in independent source families."],
+      requestedRevisions: ["Add at least one explicit cross-source mechanism citation."],
+      directives: ["Track where each source confirms the mechanism separately."],
+    });
     expect(events.find((event) => event.event_type === "synthesis_refinement_succeeded")).toBeDefined();
     expect(modelProvider.synthCallCount).toBeGreaterThanOrEqual(2);
     expect(modelProvider.reviewCallCount).toBeGreaterThanOrEqual(1);
     const output = await objectStore.getText(runOutputKey(run.id));
     expect(output).toContain("Cross-source consistency");
+  }, 60_000);
+
+  it("writes a model response artifact for every logged model request", async () => {
+    const user = await store!.createUser({ role: "user" });
+    const run = await store!.createRun({
+      userId: user.id,
+      prompt: "Track model request/response artifacts on failures.",
+      budgets: {
+        maxRuntimeMs: 60_000,
+        maxSources: 1,
+        maxFetches: 0,
+        maxBrowserRenders: 0,
+        fetchConcurrency: 1,
+        extractConcurrency: 1,
+      },
+      modelConfig: {
+        planner: "mock/planner",
+        synthesizer: "mock/synth",
+        verifier: "mock/verify",
+        verifierStrong: "mock/verify-strong",
+      },
+    });
+
+    const source = await store!.createSource({ runId: run.id, url: "https://example.com/failing-synth-source" });
+    await store!.updateSource({
+      sourceId: source.id,
+      status: "extracted",
+      finalUrl: "https://example.com/failing-synth-source",
+      title: "Failing Synth Source",
+      publisher: "Example",
+      extractKey: sourceEvidenceKey(run.id, source.id),
+    });
+    const evidence = {
+      contentText: "A policy signal appears under both positive and negative conditions.",
+      metadata: { title: "Failing Synth Source", publisher: "Example", authors: [], publishedAt: null },
+      quotes: [
+        {
+          text: "A policy signal appears under both positive and negative conditions.",
+          start: 0,
+          end: 73,
+        },
+      ],
+      chunks: [{ start: 0, end: 73, text: "A policy signal appears under both positive and negative conditions." }],
+    };
+
+    const objectStore = new FilesystemObjectStore({ rootPath: objectStoreRoot! });
+    await objectStore.putJson(sourceEvidenceKey(run.id, source.id), evidence);
+
+    await store!.updateRun({
+      runId: run.id,
+      state: {
+        version: 1,
+        nextPhase: "synthesize",
+        counters: { searchCalls: 0, fetches: 0, renders: 0, modelCalls: 0 },
+        artifacts: {},
+        startedAt: new Date().toISOString(),
+        debug: { enabled: false },
+      },
+    });
+
+    const modelProvider = new FailingSynthesisModelProvider();
+
+    await runResearchPipeline({
+      runId: run.id,
+      config: {
+        env: "test",
+        server: { host: "0.0.0.0", port: 0 },
+        worker: {
+          maxConcurrentJobs: 1,
+          pollIntervalMs: 1000,
+          leaseDurationMs: 60_000,
+          heartbeatIntervalMs: 10_000,
+        },
+        postgres: { url: store!.databaseUrl },
+        objectStore: { type: "filesystem", rootPath: objectStoreRoot! },
+        cache: { enabled: false, rootPath: path.join(objectStoreRoot!, "cache"), ttlDays: 1 },
+        debug: { traceTtlDays: 1 },
+        openRouter: {
+          apiKey: undefined,
+          baseUrl: "https://example.invalid",
+          appName: "openresearch",
+          appUrl: undefined,
+        },
+        search: {
+          backend: "searxng",
+          maxResultsPerQuery: 10,
+          searxng: { baseUrl: "http://localhost:8080" },
+          brave: { apiKey: undefined },
+        },
+        models: {
+          planner: "mock/planner",
+          synthesizer: "mock/synth",
+          verifier: "mock/verify",
+          verifierStrong: "mock/verify-strong",
+        },
+        budgets: {
+          maxRuntimeMs: 60_000,
+          maxSources: 1,
+          maxFetches: 0,
+          maxBrowserRenders: 0,
+          fetchConcurrency: 1,
+          extractConcurrency: 1,
+        },
+        citationPolicy: "balanced",
+        policies: {
+          defaultUserPolicy: {
+            requestsPerMinute: 60,
+            maxConcurrentJobs: 1,
+            downgradeThreshold: {},
+            braveSearchQuota: 0,
+          },
+          qualityProfiles: {
+            full: {
+              name: "full",
+              searchBackend: "searxng",
+              thinkingMode: "high",
+              models: {
+                planner: "mock/planner",
+                synthesizer: "mock/synth",
+                verifier: "mock/verify",
+                verifierStrong: "mock/verify-strong",
+              },
+              budgets: {},
+              enablePlaywright: false,
+              synthesis: { maxInputTokens: 1_000_000, maxOutputTokens: 500_000 },
+            },
+            degraded: {
+              name: "degraded",
+              searchBackend: "searxng",
+              thinkingMode: "low",
+              models: {
+                planner: "mock/planner",
+                synthesizer: "mock/synth",
+                verifier: "mock/verify",
+                verifierStrong: "mock/verify-strong",
+              },
+              budgets: {},
+              enablePlaywright: false,
+            },
+          },
+        },
+        safety: {
+          allowedDomains: [],
+          deniedDomains: [],
+          userAgent: "openresearch-test",
+          maxContentBytes: 1_000_000,
+        },
+      },
+      services: {
+        store: store!,
+        objectStore,
+        search: {
+          name: "mock-search",
+          async search() {
+            return [];
+          },
+        },
+        httpFetch: {
+          name: "mock-http",
+          async fetch() {
+            return {
+              ok: false,
+              url: "about:blank",
+              status: 500,
+              contentType: null,
+              body: new TextEncoder().encode(""),
+            };
+          },
+        },
+        modelProvider,
+      },
+    });
+
+    const finalRun = await store!.getRun(run.id);
+    expect(finalRun?.status).toBe("failed");
+
+    expect(modelProvider.requestCount).toBeGreaterThan(0);
+
+    const modelCallDir = path.join(objectStoreRoot!, "runs", run.id, "model-calls");
+    const phaseEntries = await fs.readdir(modelCallDir, { withFileTypes: true });
+    const requestedCalls = new Set<string>();
+    const respondedCalls = new Set<string>();
+
+    for (const phaseEntry of phaseEntries) {
+      if (!phaseEntry.isDirectory()) continue;
+      const phasePath = path.join(modelCallDir, phaseEntry.name);
+      const phaseFiles = await fs.readdir(phasePath);
+      for (const file of phaseFiles) {
+        if (file.endsWith(".request.json")) {
+          requestedCalls.add(`${phaseEntry.name}/${file.replace(/\.request\.json$/, "")}`);
+        }
+        if (file.endsWith(".response.json")) {
+          respondedCalls.add(`${phaseEntry.name}/${file.replace(/\.response\.json$/, "")}`);
+        }
+      }
+    }
+
+    expect(requestedCalls.size).toBeGreaterThan(0);
+    expect(respondedCalls.size).toBe(requestedCalls.size);
+    const missingResponses = [...requestedCalls].filter((callId) => !respondedCalls.has(callId));
+    expect(missingResponses).toEqual([]);
   }, 60_000);
 });

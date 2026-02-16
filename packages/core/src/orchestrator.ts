@@ -19,7 +19,7 @@ import {
 import type { SearchAdapter, HttpFetchAdapter, BrowserRenderAdapter } from "./adapters.js";
 import type { ExtractedEvidence } from "./extract.js";
 import { extractFromHtml, extractFromText } from "./extract.js";
-import type { ChatMessage, ModelProvider } from "./models.js";
+import type { ChatCompletionResponse, ChatMessage, ModelProvider } from "./models.js";
 import { ModelRouter } from "./model-router.js";
 import {
   debugSourceRenderedHtmlKey,
@@ -344,6 +344,59 @@ async function callModelJsonLogged<T>(input: {
   );
   await input.objectStore.putJson(requestKey, request);
 
+  const persistResponse = async (value: unknown): Promise<boolean> => {
+    try {
+      await input.objectStore.putJson(responseKey, value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const persistResponseError = async (payload: {
+    message: string;
+    name: string;
+    stack?: string;
+    reason?: string;
+  }): Promise<void> => {
+    const written = await persistResponse({
+      error: true,
+      phase: input.phase,
+      model: input.model,
+      ...payload,
+    });
+    if (written) return;
+    await persistResponse({
+      error: true,
+      phase: input.phase,
+      model: input.model,
+      name: "ModelResponsePersistenceError",
+      message: "Model response could not be persisted to object store",
+      reason: payload.reason ?? "unknown",
+      stack: payload.stack,
+    });
+  };
+
+  const normalizeResponse = (res: ChatCompletionResponse): {
+    text: string;
+    usage?: ChatCompletionResponse["usage"];
+    raw?: unknown;
+  } => {
+    const payload = {
+      text: typeof res.text === "string" ? res.text : String(res.text ?? ""),
+      ...(res.usage ? { usage: res.usage } : {}),
+    };
+    try {
+      JSON.stringify(res.raw);
+      return { ...payload, ...(res.raw === undefined ? {} : { raw: res.raw }) };
+    } catch {
+      return {
+        ...payload,
+        raw: String(res.raw),
+      };
+    }
+  };
+
   const req: Parameters<ModelProvider["chat"]>[0] = {
     model: input.model,
     messages: input.messages,
@@ -352,14 +405,37 @@ async function callModelJsonLogged<T>(input: {
   if (input.maxTokens !== undefined) req.maxTokens = input.maxTokens;
   if (input.reasoningEffort !== undefined) req.reasoningEffort = input.reasoningEffort;
 
-  const res = await input.provider.chat(req);
+  const callError = (error: unknown): { message: string; name: string; stack?: string } => {
+    if (error instanceof Error) {
+      return { name: error.name, message: error.message, ...(error.stack ? { stack: error.stack } : {}) };
+    }
+    return { name: "UnknownError", message: String(error) };
+  };
 
-  const outputHash = sha256Base64url(res.text);
-  await input.objectStore.putJson(responseKey, {
-    text: res.text,
-    usage: res.usage,
-    raw: res.raw,
-  });
+  let res: ChatCompletionResponse;
+  try {
+    res = await input.provider.chat(req);
+  } catch (error) {
+    const normalizedError = callError(error);
+    await persistResponseError({
+      ...normalizedError,
+      reason: "provider chat failed",
+    });
+    throw error;
+  }
+
+  const normalizedResponse = normalizeResponse(res);
+  const responsePersisted = await persistResponse(normalizedResponse);
+  if (!responsePersisted) {
+    await persistResponseError({
+      name: "ModelResponsePersistenceError",
+      message: "Unable to persist model response",
+      reason: "response persist failed",
+      ...(normalizedResponse.text ? { stack: String(normalizedResponse.text).slice(0, 400) } : {}),
+    });
+  }
+
+  const outputHash = sha256Base64url(normalizedResponse.text);
 
   input.checkpoint.counters.modelCalls++;
 
@@ -389,7 +465,7 @@ async function callModelJsonLogged<T>(input: {
 
   input.store.updateRun({ runId: input.runId, state: input.checkpoint }).catch(() => {});
 
-  const json = extractFirstJson(res.text);
+  const json = extractFirstJson(normalizedResponse.text);
   return input.schema.parse(json);
 }
 
@@ -557,6 +633,20 @@ const SYNTHESIS_REVIEW_SCHEMA = z.object({
 
 type SynthesisSourceAbstract = z.infer<typeof SYNTHESIS_SOURCE_ABSTRACTS_OUTPUT_SCHEMA.shape.sourceAbstracts.element>;
 type SynthesisReviewOutput = z.infer<typeof SYNTHESIS_REVIEW_SCHEMA>;
+type SynthesisReviewIssue = {
+  findingId: string;
+  issue: string;
+  why: string;
+  strengtheningAlternative: string;
+};
+type SynthesisReviewFeedbackPayload = {
+  verdict: SynthesisReviewOutput["verdict"];
+  unsupportedConclusions: SynthesisReviewIssue[];
+  missingEvidence: string[];
+  requestedRevisions: string[];
+  confidenceRisk?: number;
+  directives: string[];
+};
 
 function clampPositiveInteger(
   value: unknown,
@@ -1595,7 +1685,7 @@ function buildSynthesisPromptPayload(input: {
   sources: SynthesisSourceBrief[];
   sourceAbstracts?: SynthesisSourceAbstract[];
   criticalSourceContexts?: Array<{ source: string; reason: string; excerpt: string }>;
-  reviewFeedback?: string[];
+  reviewFeedback?: SynthesisReviewFeedbackPayload;
   targets: SynthesisPromptTargets;
   previousSynthesis?: SynthesisOutput;
   refinementPass?: number;
@@ -2656,6 +2746,7 @@ async function synthesizePhase(input: {
   let previousSynthesis: SynthesisOutput | undefined;
   let lastTrimResult: SynthesisContextTrimResult | undefined;
   let reviewDirectives: string[] = [];
+  let reviewFeedback: SynthesisReviewFeedbackPayload | undefined;
 
   const logOutputCapEvent = async (
     trimResult: SynthesisContextTrimResult,
@@ -2761,12 +2852,12 @@ async function synthesizePhase(input: {
           sources: trimResult.sourceBriefs,
           sourceAbstracts: trimResult.sourceAbstracts,
           criticalSourceContexts: trimResult.criticalSourceContexts,
-          ...(reviewDirectives.length > 0 ? { reviewFeedback: reviewDirectives } : {}),
+          ...(reviewFeedback ? { reviewFeedback } : {}),
           targets,
           sourceCountBefore: sourceCountCap,
           ...(previousSynthesis ? { previousSynthesis } : {}),
           refinementPass: attempt,
-          ...(reviewDirectives.length > 0 ? { requireReviewIteration: true } : {}),
+          ...(reviewFeedback ? { requireReviewIteration: true } : {}),
         })
       ),
     };
@@ -2833,9 +2924,36 @@ async function synthesizePhase(input: {
         objectStore: input.objectStore,
         checkpoint: input.checkpoint,
       });
-      if (!review || review.verdict === "accept") return true;
+      if (!review) return true;
       const unsupportedConclusions = review.unsupportedConclusions ?? [];
       const requestedRevisions = review.requestedRevisions ?? [];
+      const missingEvidence = review.missingEvidence ?? [];
+
+      await input.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "synthesize",
+          eventType: "synthesis_review_feedback",
+          message: "Reviewer feedback received for synthesis draft",
+          data: {
+            verdict: review.verdict,
+            attempt: attempt + 1,
+            confidenceRisk: review.confidenceRisk,
+            unsupportedConclusions: unsupportedConclusions.map((issue) => ({
+              findingId: issue.findingId,
+              issue: issue.issue,
+              why: issue.why,
+              strengtheningAlternative: issue.strengtheningAlternative,
+            })),
+            missingEvidence,
+            requestedRevisions,
+          },
+        })
+        .catch(() => {});
+
+      if (review.verdict === "accept") return true;
+
       if (review.verdict === "revise" || review.verdict === "reject") {
         if (unsupportedConclusions.length > 0) {
           reviewDirectives = unsupportedConclusions
@@ -2852,6 +2970,14 @@ async function synthesizePhase(input: {
               (issue) => `Reviewer issue (${issue.findingId}): ${issue.issue}`
             ),
           ],
+        };
+        reviewFeedback = {
+          verdict: review.verdict,
+          unsupportedConclusions,
+          missingEvidence,
+          requestedRevisions,
+          directives: reviewDirectives,
+          ...(review.confidenceRisk === undefined ? {} : { confidenceRisk: review.confidenceRisk }),
         };
         await input.store
           .addRunEvent({

@@ -1,6 +1,11 @@
 import { Command } from "commander";
 
-import { loadConfig, runOutputKey, runResearchPipeline } from "@openresearch/core";
+import {
+  loadConfig,
+  runCitationMapKey,
+  runOutputKey,
+  runResearchPipeline,
+} from "@openresearch/core";
 import {
   BraveSearchAdapter,
   HttpFetchAdapterImpl,
@@ -119,6 +124,7 @@ type DbRun = {
   status: "queued" | "running" | "failed" | "completed" | "canceled";
   phase: string | null;
   started_at: string | null;
+  finished_at: string | null;
   state: unknown;
 };
 
@@ -126,6 +132,16 @@ type DbSource = {
   id: string;
   url: string;
   status: "pending" | "fetched" | "rendered" | "extracted" | "failed" | "skipped";
+};
+
+type DbModelCall = {
+  id: string;
+  run_id: string;
+  phase: string;
+  model_id: string;
+  created_at: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -142,6 +158,29 @@ function formatElapsed(startedAt: number): string {
 
 function safeString(value: unknown): string {
   return typeof value === "string" ? value : "unknown";
+}
+
+function formatDurationMs(ms: number): string {
+  const totalMs = Math.max(0, Math.floor(ms));
+  const totalSec = Math.floor(totalMs / 1000);
+  const hrs = Math.floor(totalSec / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = String(totalSec % 60).padStart(2, "0");
+  if (hrs > 0) return `${hrs}h ${mins}m ${secs}s`;
+  return `${mins}m ${secs}s`;
+}
+
+function normalizeCount(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  }
+  return 0;
+}
+
+function normalizeText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 type CliTodoItem = {
@@ -178,6 +217,49 @@ function formatTodoHints(rawHints: unknown): string[] {
     .filter((value): value is string => Boolean(value));
 }
 
+function formatReviewUnsupportedConclusions(
+  rawConclusions: unknown
+): Array<{
+  findingId: string;
+  issue: string;
+  why: string;
+  strengtheningAlternative: string;
+}> {
+  if (!Array.isArray(rawConclusions)) return [];
+  return rawConclusions
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const source = item as {
+        findingId?: unknown;
+        issue?: unknown;
+        why?: unknown;
+        strengtheningAlternative?: unknown;
+      };
+      const findingId = typeof source.findingId === "string" ? source.findingId.trim() : "";
+      const issue = typeof source.issue === "string" ? source.issue.trim() : "";
+      const why = typeof source.why === "string" ? source.why.trim() : "";
+      const strengtheningAlternative =
+        typeof source.strengtheningAlternative === "string" ? source.strengtheningAlternative.trim() : "";
+      if (!findingId || !issue || !why || !strengtheningAlternative) return null;
+      return { findingId, issue, why, strengtheningAlternative };
+    })
+    .filter(
+      (value): value is {
+        findingId: string;
+        issue: string;
+        why: string;
+        strengtheningAlternative: string;
+      } => value !== null
+    );
+}
+
+function formatStringList(rawValues: unknown): string[] {
+  if (!Array.isArray(rawValues)) return [];
+  return rawValues
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((value): value is string => Boolean(value));
+}
+
 function eventLabel(event: DbRunEvent): string {
   if (event.event_type === "plan_todo_list_ready") {
     const message = event.message ?? "Plan to-do list generated";
@@ -189,6 +271,55 @@ function eventLabel(event: DbRunEvent): string {
     const lines = [message, ...items.map((item) => `  [${item.index}] ${item.text}`)];
     if (hints.length > 0) {
       lines.push(`  Hints: ${hints.join(" | ")}`);
+    }
+    return lines.join("\n");
+  }
+  if (event.event_type === "synthesis_review_feedback") {
+    const data = event.data && typeof event.data === "object" ? event.data : {};
+    const verdict = typeof data.verdict === "string" ? data.verdict : "unknown";
+    const attempt =
+      typeof data.attempt === "number" && Number.isFinite(data.attempt) ? data.attempt : undefined;
+    const confidenceRisk =
+      typeof data.confidenceRisk === "number" && Number.isFinite(data.confidenceRisk)
+        ? data.confidenceRisk
+        : undefined;
+    const unsupported = formatReviewUnsupportedConclusions(data.unsupportedConclusions);
+    const missingEvidence = formatStringList(data.missingEvidence);
+    const revisions = formatStringList(data.requestedRevisions);
+    const lines = [
+      `Reviewer feedback received${attempt ? ` (attempt ${attempt})` : ""}: ${verdict}`,
+    ];
+    if (unsupported.length > 0) {
+      lines.push("  Unsupported conclusions:");
+      unsupported.slice(0, 4).forEach((item, index) => {
+        lines.push(`    [${index + 1}] ${item.findingId}: ${item.issue}`);
+        lines.push(`      Why: ${item.why}`);
+        lines.push(`      Revision: ${item.strengtheningAlternative}`);
+      });
+      if (unsupported.length > 4) {
+        lines.push(`    + ${unsupported.length - 4} more unsupported findings omitted`);
+      }
+    }
+    if (missingEvidence.length > 0) {
+      lines.push("  Missing evidence:");
+      missingEvidence.slice(0, 4).forEach((item, index) => {
+        lines.push(`    [${index + 1}] ${item}`);
+      });
+      if (missingEvidence.length > 4) {
+        lines.push(`    + ${missingEvidence.length - 4} more missing-evidence items omitted`);
+      }
+    }
+    if (revisions.length > 0) {
+      lines.push("  Requested revisions:");
+      revisions.slice(0, 4).forEach((item, index) => {
+        lines.push(`    [${index + 1}] ${item}`);
+      });
+      if (revisions.length > 4) {
+        lines.push(`    + ${revisions.length - 4} more requested revisions omitted`);
+      }
+    }
+    if (confidenceRisk !== undefined) {
+      lines.push(`  Confidence risk: ${confidenceRisk}`);
     }
     return lines.join("\n");
   }
@@ -244,6 +375,264 @@ function summarizeCheckpoint(state: unknown): string {
   return `search=${String(counters.searchCalls ?? 0)}, fetch=${String(
     counters.fetches ?? 0
   )}, render=${String(counters.renders ?? 0)}, model=${String(counters.modelCalls ?? 0)}`;
+}
+
+type PhaseTokenBucket = {
+  calls: number;
+  tokensIn: number;
+  tokensOut: number;
+};
+
+function collectRunFinalStats(input: {
+  run: DbRun;
+  sources: DbSource[];
+  events: DbRunEvent[];
+  modelCalls: DbModelCall[];
+  verifiedClaims?: number;
+}) {
+  const status = input.run.status;
+  const totalSources = input.sources.length;
+  const sourceStatusCounts: Record<string, number> = {
+    pending: 0,
+    fetched: 0,
+    rendered: 0,
+    extracted: 0,
+    failed: 0,
+    skipped: 0,
+  };
+  for (const source of input.sources) {
+    if (sourceStatusCounts[source.status] !== undefined) sourceStatusCounts[source.status] += 1;
+  }
+
+  const eventTypeCounts: Record<string, number> = {};
+  const phaseCounts: Record<string, number> = {};
+  let searchQueries = 0;
+  let searchQueryResultCount = 0;
+  const discoveredUrls = new Set<string>();
+  let planPasses = 0;
+  let planPassCompletions = 0;
+  let planFollowUpsTrimmed = 0;
+  let planContinueRequests = 0;
+  let planCapReached = 0;
+  let synthesisAttemptsUsed = 1;
+  let synthesisRefinementRequests = 0;
+  let synthesisRefinementCompleted = 0;
+  let reviewFeedbacks = 0;
+  let reviewRequests = 0;
+  let reviewAttempts = 0;
+  let errorEvents = 0;
+  let warningEvents = 0;
+
+  for (const event of input.events) {
+    eventTypeCounts[event.event_type] = (eventTypeCounts[event.event_type] ?? 0) + 1;
+    if (event.phase) phaseCounts[event.phase] = (phaseCounts[event.phase] ?? 0) + 1;
+    if (event.level === "error") errorEvents += 1;
+    if (event.level === "warn") warningEvents += 1;
+
+    if (event.event_type === "search_query_started" || event.event_type === "search_query_completed") {
+      searchQueries += 1;
+    }
+    if (event.event_type === "search_query_completed") {
+      searchQueryResultCount += normalizeCount(event.data?.results);
+    }
+    if (event.event_type === "search_result_candidate") {
+      const url = normalizeText(event.data?.url);
+      if (url) discoveredUrls.add(url);
+    }
+
+    if (event.event_type === "plan_pass_started" || event.event_type === "plan_pass_completed") {
+      const pass = normalizeCount(event.data?.pass);
+      if (pass > planPasses) planPasses = pass;
+    }
+    if (event.event_type === "plan_pass_completed") {
+      planPassCompletions += 1;
+    }
+    if (event.event_type === "plan_follow_ups_trimmed") {
+      planFollowUpsTrimmed += 1;
+    }
+    if (event.event_type === "plan_continue_requested") {
+      planContinueRequests += 1;
+      const pass = normalizeCount(event.data?.pass);
+      if (pass > planPasses) planPasses = pass;
+    }
+    if (event.event_type === "plan_loop_cap_reached") planCapReached += 1;
+
+    if (event.event_type === "synthesis_refinement_requested") {
+      synthesisRefinementRequests += 1;
+      const attempt = normalizeCount(event.data?.attempt);
+      if (attempt > 0) {
+        synthesisAttemptsUsed = Math.max(synthesisAttemptsUsed, attempt + 1);
+      }
+    }
+    if (
+      event.event_type === "synthesis_refinement_succeeded" ||
+      event.event_type === "synthesis_refinement_exhausted"
+    ) {
+      const attemptsUsed = normalizeCount(event.data?.attemptsUsed);
+      if (attemptsUsed > 0) synthesisAttemptsUsed = Math.max(synthesisAttemptsUsed, attemptsUsed);
+      synthesisRefinementCompleted += 1;
+    }
+    if (event.event_type === "synthesis_review_requested") {
+      reviewRequests += 1;
+    }
+    if (event.event_type === "synthesis_review_feedback") {
+      reviewFeedbacks += 1;
+      const attempt = normalizeCount(event.data?.attempt);
+      if (attempt > 0) synthesisAttemptsUsed = Math.max(synthesisAttemptsUsed, attempt);
+      reviewAttempts = Math.max(reviewAttempts, attempt || reviewAttempts);
+    }
+  }
+
+  const phaseTokenStats: Record<string, PhaseTokenBucket> = {};
+  let totalModelCalls = 0;
+  let totalTokensIn = 0;
+  let totalTokensOut = 0;
+  for (const modelCall of input.modelCalls) {
+    const phase = modelCall.phase || "unknown";
+    const bucket = phaseTokenStats[phase] ?? { calls: 0, tokensIn: 0, tokensOut: 0 };
+    bucket.calls += 1;
+    bucket.tokensIn += Math.max(0, modelCall.tokens_in ?? 0);
+    bucket.tokensOut += Math.max(0, modelCall.tokens_out ?? 0);
+    phaseTokenStats[phase] = bucket;
+    totalModelCalls += 1;
+    totalTokensIn += Math.max(0, modelCall.tokens_in ?? 0);
+    totalTokensOut += Math.max(0, modelCall.tokens_out ?? 0);
+  }
+
+  const scannedSources = discoveredUrls.size || searchQueryResultCount;
+  const filteredSources = sourceStatusCounts.skipped + sourceStatusCounts.failed;
+  const parsedSources = sourceStatusCounts.extracted;
+  const verifiedClaims = input.verifiedClaims ?? 0;
+
+  const parsedStart = input.run.started_at ? Date.parse(input.run.started_at) : NaN;
+  const parsedFinish = input.run.finished_at ? Date.parse(input.run.finished_at) : Date.now();
+  const durationMs = Number.isFinite(parsedStart)
+    ? Math.max(0, parsedFinish - parsedStart)
+    : undefined;
+
+  return {
+    startedAt: Number.isFinite(parsedStart) ? new Date(parsedStart).toISOString() : "unknown",
+    finishedAt: Number.isFinite(parsedFinish) ? new Date(parsedFinish).toISOString() : "unknown",
+    status,
+    totalSources,
+    sourceStatusCounts,
+    scannedSources,
+    filteredSources,
+    parsedSources,
+    verifiedClaims,
+    events: {
+      total: input.events.length,
+      errorEvents,
+      warningEvents,
+      eventTypeCounts,
+      phaseCounts,
+    },
+    retrieval: {
+      searchQueries,
+      searchQueryResultCount,
+      discoveredUrls: discoveredUrls.size,
+    },
+    passes: {
+      planPasses,
+      planContinueRequests,
+      planCapReached,
+      planPassCompletions,
+      planFollowUpsTrimmed,
+      synthesisAttemptsUsed,
+      synthesisRefinementRequests,
+      synthesisRefinementCompleted,
+      reviewFeedbacks,
+      reviewRequests,
+      reviewAttempts,
+    },
+    model: {
+      totalModelCalls,
+      totalTokensIn,
+      totalTokensOut,
+      byPhase: phaseTokenStats,
+    },
+    durationMs,
+  };
+}
+
+function printRunFinalStats(input: {
+  summary: ReturnType<typeof collectRunFinalStats>;
+}) {
+  const { summary } = input;
+  const orderedPhases = ["plan", "retrieve", "fetch", "extract", "synthesize", "verify", "finalize", "unknown"];
+  const modelRows = orderedPhases
+    .filter((phase) => summary.model.byPhase[phase]?.calls)
+    .map((phase) => {
+      const bucket = summary.model.byPhase[phase];
+      return `    ${phase.padEnd(9)} calls=${String(bucket.calls).padStart(3)} in=${String(
+        bucket.tokensIn
+      ).padStart(7)} out=${String(bucket.tokensOut).padStart(7)}`;
+    });
+
+  const allBuckets = Object.entries(summary.model.byPhase)
+    .filter(([phase]) => !orderedPhases.includes(phase))
+    .sort(([a], [b]) => a.localeCompare(b));
+  for (const [phase, bucket] of allBuckets) {
+    modelRows.push(
+      `    ${phase.padEnd(9)} calls=${String(bucket.calls).padStart(3)} in=${String(
+        bucket.tokensIn
+      ).padStart(7)} out=${String(bucket.tokensOut).padStart(7)}`
+    );
+  }
+
+  if (modelRows.length === 0) {
+    modelRows.push("    no model calls were recorded");
+  }
+
+  const loopPassSummaryParts: string[] = [];
+  if (summary.passes.planPassCompletions > 0) {
+    loopPassSummaryParts.push(`plan=${summary.passes.planPassCompletions}`);
+  }
+  if (summary.passes.reviewRequests > 0) {
+    loopPassSummaryParts.push(`review=${summary.passes.reviewRequests}`);
+  }
+  if (summary.passes.synthesisRefinementCompleted > 0) {
+    loopPassSummaryParts.push(`refinement=${summary.passes.synthesisRefinementCompleted}`);
+  }
+  const loopSummary = loopPassSummaryParts.length > 0 ? loopPassSummaryParts.join(", ") : "n/a";
+
+  console.log(`Run Status: ${summary.status}`);
+  console.log(`Run Final Stats`);
+  console.log(
+    `  Time: ${
+      summary.durationMs === undefined ? "unknown" : formatDurationMs(summary.durationMs)
+    } (started: ${summary.startedAt}, finished: ${summary.finishedAt})`
+  );
+  console.log(
+    `  Items: scanned=${summary.scannedSources} selected=${summary.totalSources} parsed=${summary.parsedSources} filtered=${summary.filteredSources} verified=${summary.verifiedClaims}`
+  );
+  console.log(
+    `  Source health: failed=${summary.sourceStatusCounts.failed} skipped=${summary.sourceStatusCounts.skipped}`
+  );
+  console.log(`  Verified: claims=${summary.verifiedClaims}`);
+  console.log(
+    `  Tokens: total in=${summary.model.totalTokensIn} out=${summary.model.totalTokensOut} calls=${summary.model.totalModelCalls}`
+  );
+  console.log("  Tokens by phase:");
+  for (const row of modelRows) console.log(row);
+  console.log(
+    `  Retrieval: queries=${summary.retrieval.searchQueries} candidates=${summary.retrieval.discoveredUrls} result-items=${summary.retrieval.searchQueryResultCount}`
+  );
+  console.log(
+    `  Loop passes: ${loopSummary}`
+  );
+  console.log(
+    `  Planning: maxPass=${summary.passes.planPasses} completed=${summary.passes.planPassCompletions} continueRequests=${summary.passes.planContinueRequests} trimmed=${summary.passes.planFollowUpsTrimmed} capped=${summary.passes.planCapReached}`
+  );
+  console.log(
+    `  Synthesis loop: attempts=${summary.passes.synthesisAttemptsUsed} refinementRequested=${summary.passes.synthesisRefinementRequests} reviewRequested=${summary.passes.reviewRequests} reviewFeedback=${summary.passes.reviewFeedbacks}`
+  );
+  if (summary.passes.reviewAttempts > 0) {
+    console.log(`  Synthesis review attempts tracked: ${summary.passes.reviewAttempts}`);
+  }
+  console.log(
+    `  Events: total=${summary.events.total} warnings=${summary.events.warningEvents} errors=${summary.events.errorEvents}`
+  );
 }
 
 async function streamRunProgress({
@@ -360,6 +749,29 @@ program
       const md = await objectStore.getText(runOutputKey(run.id));
       if (md) process.stdout.write(md);
       console.log(`\n\nRun: ${run.id}`);
+
+      const [finalRun, sources, events, modelCalls] = await Promise.all([
+        store.getRun(run.id),
+        store.listSources(run.id),
+        store.listRunEvents(run.id, { limit: 1000 }),
+        store.listModelCalls(run.id),
+      ]);
+      if (finalRun) {
+        let verifiedClaims = 0;
+        const citationMap = await objectStore.getJson( runCitationMapKey(run.id) );
+        if (citationMap && typeof citationMap === "object") {
+          const claims = (citationMap as { claims?: unknown[] }).claims;
+          if (Array.isArray(claims)) verifiedClaims = claims.length;
+        }
+        const summary = collectRunFinalStats({
+          run: finalRun as DbRun,
+          sources,
+          events,
+          modelCalls,
+          verifiedClaims,
+        });
+        printRunFinalStats({ summary });
+      }
     } finally {
       await store.close();
     }
