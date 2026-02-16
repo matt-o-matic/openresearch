@@ -56,12 +56,26 @@ export const BudgetConfigSchema = z.object({
 });
 export type BudgetConfig = z.infer<typeof BudgetConfigSchema>;
 
+export const AgenticLoopConfigSchema = z.object({
+  maxPlanPasses: z.number().int().positive().default(5),
+  maxFollowUpTasksPerPass: z.number().int().positive().default(10),
+});
+export type AgenticLoopConfig = z.infer<typeof AgenticLoopConfigSchema>;
+
+export const SynthesisConfigSchema = z.object({
+  maxInputTokens: z.number().int().positive().default(1_000_000),
+  maxOutputTokens: z.number().int().positive().default(500_000),
+});
+export type SynthesisConfig = z.infer<typeof SynthesisConfigSchema>;
+
 export const QualityProfileSchema = z.object({
   name: z.string().optional(),
   searchBackend: z.enum(["searxng", "brave"]).default("searxng"),
   thinkingMode: ThinkingModeSchema,
   models: PhaseModelConfigSchema.default({}),
   budgets: BudgetConfigSchema.partial().default({}),
+  agenticLoop: AgenticLoopConfigSchema.default({}),
+  synthesis: SynthesisConfigSchema.default({}),
   enablePlaywright: z.boolean().default(true),
 });
 export type QualityProfile = z.infer<typeof QualityProfileSchema>;
@@ -159,6 +173,14 @@ export const OpenResearchConfigSchema = z.object({
               fetchConcurrency: 4,
               extractConcurrency: 4,
             },
+            agenticLoop: {
+              maxPlanPasses: 5,
+              maxFollowUpTasksPerPass: 10,
+            },
+            synthesis: {
+              maxInputTokens: 1_000_000,
+              maxOutputTokens: 500_000,
+            },
           }),
           degraded: QualityProfileSchema.default({
             name: "degraded",
@@ -178,6 +200,14 @@ export const OpenResearchConfigSchema = z.object({
               maxBrowserRenders: 2,
               fetchConcurrency: 2,
               extractConcurrency: 2,
+            },
+            agenticLoop: {
+              maxPlanPasses: 5,
+              maxFollowUpTasksPerPass: 10,
+            },
+            synthesis: {
+              maxInputTokens: 1_000_000,
+              maxOutputTokens: 500_000,
             },
           }),
         })

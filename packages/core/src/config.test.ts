@@ -58,4 +58,47 @@ describe("loadConfig", () => {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("applies default agentic-loop and synthesis caps for quality profiles", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openresearch-config-profile-"));
+    try {
+      const configPath = path.join(dir, "openresearch.config.json");
+      await fs.writeFile(
+        configPath,
+        JSON.stringify(
+          {
+            policies: {
+              qualityProfiles: {
+                full: { thinkingMode: "high", models: {}, budgets: {} },
+                degraded: { thinkingMode: "low", models: {}, budgets: {} },
+              },
+            },
+          },
+          null,
+          2
+        )
+      );
+      process.env.OPENRESEARCH_CONFIG = configPath;
+
+      const config = await loadConfig();
+      expect(config.policies.qualityProfiles.full.agenticLoop).toMatchObject({
+        maxPlanPasses: 5,
+        maxFollowUpTasksPerPass: 10,
+      });
+      expect(config.policies.qualityProfiles.full.synthesis).toMatchObject({
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 500_000,
+      });
+      expect(config.policies.qualityProfiles.degraded.agenticLoop).toMatchObject({
+        maxPlanPasses: 5,
+        maxFollowUpTasksPerPass: 10,
+      });
+      expect(config.policies.qualityProfiles.degraded.synthesis).toMatchObject({
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 500_000,
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });

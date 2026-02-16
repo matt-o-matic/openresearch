@@ -144,7 +144,55 @@ function safeString(value: unknown): string {
   return typeof value === "string" ? value : "unknown";
 }
 
+type CliTodoItem = {
+  index: number;
+  text: string;
+};
+
+function formatTodoItems(rawItems: unknown): CliTodoItem[] {
+  if (!Array.isArray(rawItems)) return [];
+  return rawItems
+    .map((item, defaultIndex) => {
+      if (typeof item === "string") {
+        const text = item.trim();
+        if (!text) return null;
+        return { index: defaultIndex + 1, text };
+      }
+      if (item && typeof item === "object") {
+        const asObject = item as { text?: unknown; index?: unknown };
+        if (typeof asObject.text === "string") {
+          const normalized = asObject.text.trim();
+          const indexValue = typeof asObject.index === "number" && Number.isFinite(asObject.index) ? asObject.index : defaultIndex + 1;
+          if (normalized) return { index: indexValue, text: normalized };
+        }
+      }
+      return null;
+    })
+    .filter((value): value is CliTodoItem => value !== null);
+}
+
+function formatTodoHints(rawHints: unknown): string[] {
+  if (!Array.isArray(rawHints)) return [];
+  return rawHints
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((value): value is string => Boolean(value));
+}
+
 function eventLabel(event: DbRunEvent): string {
+  if (event.event_type === "plan_todo_list_ready") {
+    const message = event.message ?? "Plan to-do list generated";
+    const items = formatTodoItems(event.data?.items);
+    const hints = formatTodoHints(event.data?.queryHints);
+    if (items.length === 0) {
+      return message;
+    }
+    const lines = [message, ...items.map((item) => `  [${item.index}] ${item.text}`)];
+    if (hints.length > 0) {
+      lines.push(`  Hints: ${hints.join(" | ")}`);
+    }
+    return lines.join("\n");
+  }
+
   if (event.message) return event.message;
   switch (event.event_type) {
     case "search_result_candidate":
@@ -292,6 +340,8 @@ program
           enablePlaywright: true,
           thinkingMode: config.policies.qualityProfiles.full.thinkingMode,
           debugCapture: opts.debugCapture,
+          agenticLoop: config.policies.qualityProfiles.full.agenticLoop,
+          synthesis: config.policies.qualityProfiles.full.synthesis,
         },
         qualityTier: "full",
       });

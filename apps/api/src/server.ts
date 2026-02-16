@@ -142,11 +142,11 @@ export async function buildApiServer(input: {
     const usageRow = await input.store.getUsageMonth(auth.user.id);
     const usage = usageSnapshotFromRow(usageRow);
 
-    const { tier, profile, effectiveConfig } = selectQualityForUser({
-      config: input.config,
-      userPolicy: auth.user.policy,
-      usage,
-    });
+      const { tier, profile, effectiveConfig } = selectQualityForUser({
+        config: input.config,
+        userPolicy: auth.user.policy,
+        usage,
+      });
 
     const run = await input.store.createRun({
       userId: auth.user.id,
@@ -154,14 +154,16 @@ export async function buildApiServer(input: {
       citationPolicy: body.citationPolicy ?? effectiveConfig.citationPolicy,
       budgets: effectiveConfig.budgets,
       modelConfig: effectiveConfig.models,
-      adapterConfig: {
-        searchBackend: profile.searchBackend,
-        thinkingMode: profile.thinkingMode,
-        enablePlaywright: profile.enablePlaywright,
-        debugCapture: body.debugCapture === true,
-      },
-      qualityTier: tier,
-    });
+        adapterConfig: {
+          searchBackend: profile.searchBackend,
+          thinkingMode: profile.thinkingMode,
+          enablePlaywright: profile.enablePlaywright,
+          debugCapture: body.debugCapture === true,
+          agenticLoop: profile.agenticLoop,
+          synthesis: profile.synthesis,
+        },
+        qualityTier: tier,
+      });
 
     const job = await input.store.createJob({ runId: run.id, userId: auth.user.id, priority: 0 });
     await input.store.addRunEvent({
