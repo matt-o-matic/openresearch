@@ -1,0 +1,21 @@
+{
+  "name": "@openresearch/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --sourcemap"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^25.0.1",
+    "p-limit": "^5.0.0",
+    "zod": "^3.24.2"
+  }
+}

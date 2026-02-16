@@ -1,0 +1,20 @@
+{
+  "name": "@openresearch/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "openresearch": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup"
+  },
+  "dependencies": {
+    "@openresearch/adapters": "0.1.0",
+    "@openresearch/api": "0.1.0",
+    "@openresearch/core": "0.1.0",
+    "@openresearch/storage": "0.1.0",
+    "@openresearch/worker": "0.1.0",
+    "commander": "^12.1.0"
+  }
+}

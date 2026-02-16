@@ -1,0 +1,25 @@
+{
+  "name": "@openresearch/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    },
+    "./server": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/server.ts --format esm --dts --sourcemap",
+    "dev": "node --enable-source-maps dist/index.js"
+  },
+  "dependencies": {
+    "@openresearch/core": "0.1.0",
+    "@openresearch/storage": "0.1.0",
+    "fastify": "^5.2.1"
+  }
+}

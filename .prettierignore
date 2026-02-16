@@ -1,0 +1,7 @@
+dist
+node_modules
+.openresearch
+.codex-designer
+docs/init-impl.plan.md
+docs/init-impl.qna.md
+docs/init-impl.impl.md

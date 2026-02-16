@@ -1,0 +1,117 @@
+{
+  "env": "dev",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8787
+  },
+  "worker": {
+    "maxConcurrentJobs": 2,
+    "pollIntervalMs": 2000,
+    "leaseDurationMs": 60000,
+    "heartbeatIntervalMs": 15000
+  },
+  "postgres": {
+    "url": "postgres://openresearch:openresearch@localhost:5432/openresearch"
+  },
+  "objectStore": {
+    "type": "filesystem",
+    "rootPath": ".openresearch/object-store"
+  },
+  "cache": {
+    "enabled": true,
+    "rootPath": ".openresearch/cache",
+    "ttlDays": 7
+  },
+  "debug": {
+    "traceTtlDays": 7
+  },
+  "openRouter": {
+    "apiKey": "env:OPENROUTER_API_KEY",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "appName": "openresearch",
+    "appUrl": "https://example.com"
+  },
+  "search": {
+    "backend": "searxng",
+    "maxResultsPerQuery": 10,
+    "searxng": { "baseUrl": "http://localhost:8080" },
+    "brave": { "apiKey": "env:BRAVE_API_KEY" }
+  },
+  "models": {
+    "planner": "openai/gpt-4o-mini",
+    "synthesizer": "openai/gpt-4o-mini",
+    "verifier": "openai/gpt-4o-mini",
+    "verifierStrong": "openai/gpt-4o"
+  },
+  "budgets": {
+    "maxRuntimeMs": 300000,
+    "maxSources": 10,
+    "maxFetches": 20,
+    "maxBrowserRenders": 5,
+    "fetchConcurrency": 4,
+    "extractConcurrency": 4
+  },
+  "citationPolicy": "balanced",
+  "policies": {
+    "defaultUserPolicy": {
+      "requestsPerMinute": 60,
+      "maxConcurrentJobs": 1,
+      "downgradeThreshold": {
+        "costUsd": 5,
+        "modelTokens": 250000,
+        "searchCalls": 250,
+        "fetches": 500,
+        "renders": 50
+      },
+      "braveSearchQuota": 0
+    },
+    "qualityProfiles": {
+      "full": {
+        "name": "full",
+        "searchBackend": "searxng",
+        "thinkingMode": "high",
+        "enablePlaywright": true,
+        "models": {
+          "planner": "openai/gpt-4o-mini",
+          "synthesizer": "openai/gpt-4o-mini",
+          "verifier": "openai/gpt-4o-mini",
+          "verifierStrong": "openai/gpt-4o"
+        },
+        "budgets": {
+          "maxRuntimeMs": 300000,
+          "maxSources": 10,
+          "maxFetches": 20,
+          "maxBrowserRenders": 5,
+          "fetchConcurrency": 4,
+          "extractConcurrency": 4
+        }
+      },
+      "degraded": {
+        "name": "degraded",
+        "searchBackend": "searxng",
+        "thinkingMode": "low",
+        "enablePlaywright": true,
+        "models": {
+          "planner": "openai/gpt-4o-mini",
+          "synthesizer": "openai/gpt-4o-mini",
+          "verifier": "openai/gpt-4o-mini",
+          "verifierStrong": "openai/gpt-4o-mini"
+        },
+        "budgets": {
+          "maxRuntimeMs": 180000,
+          "maxSources": 5,
+          "maxFetches": 10,
+          "maxBrowserRenders": 2,
+          "fetchConcurrency": 2,
+          "extractConcurrency": 2
+        }
+      }
+    }
+  },
+  "safety": {
+    "allowedDomains": [],
+    "deniedDomains": [],
+    "userAgent": "openresearch/0.1.0",
+    "maxContentBytes": 2000000
+  }
+}

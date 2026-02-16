@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "@openresearch/core": ["packages/core/src/index.ts"],
+      "@openresearch/adapters": ["packages/adapters/src/index.ts"],
+      "@openresearch/storage": ["packages/storage/src/index.ts"],
+      "@openresearch/api": ["apps/api/src/server.ts"],
+      "@openresearch/worker": ["apps/worker/src/worker.ts"]
+    },
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  }
+}

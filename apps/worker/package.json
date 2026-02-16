@@ -1,0 +1,24 @@
+{
+  "name": "@openresearch/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/worker.js",
+      "types": "./dist/worker.d.ts"
+    },
+    "./worker": {
+      "import": "./dist/worker.js",
+      "types": "./dist/worker.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/worker.ts --format esm --dts --sourcemap"
+  },
+  "dependencies": {
+    "@openresearch/adapters": "0.1.0",
+    "@openresearch/core": "0.1.0",
+    "@openresearch/storage": "0.1.0"
+  }
+}

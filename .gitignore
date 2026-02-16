@@ -1,0 +1,68 @@
+# Dependencies
+node_modules/
+.openresearch/
+
+openresearch.config.json
+dist/
+
+# Logs
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+logs/
+*.log
+
+# Runtime / process files
+.pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage and test artifacts
+coverage/
+.nyc_output/
+.vitest/
+
+# Build outputs
+/dist/
+/build/
+/*.tsbuildinfo
+
+# TypeScript / JS caches
+.cache/
+.next/
+.parcel-cache/
+
+# Editor folders
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# OS generated
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Env and local config
+.env
+.env.local
+.env.*.local
+
+# Docker
+docker-compose.override.yml
+
+# Playwright
+playwright-report/
+playwright/.cache/
+
+# Database and temporary data
+.pgdata/
+/tmp/
+/tmpfs/
+
+# Fastify/Node runtime test state
+*server.pid
