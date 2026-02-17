@@ -78,6 +78,7 @@ export const ResearchLoopConfigSchema = z
     sourcesPerIteration: z.number().int().positive().optional(),
     mode: ResearchLoopModeSchema,
     switchToHybridAfterRejects: z.number().int().positive().default(2),
+    fullContext: z.boolean().optional(),
   })
   .default({});
 export type ResearchLoopConfig = z.infer<typeof ResearchLoopConfigSchema>;

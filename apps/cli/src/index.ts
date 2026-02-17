@@ -155,6 +155,18 @@ function runLogKey(runId: string): string {
 
 type CliLog = (...parts: unknown[]) => void;
 
+type VerbosityLevel = 0 | 1 | 2 | 3;
+
+function coerceVerbosityLevel(value: unknown): VerbosityLevel {
+  const raw = typeof value === "string" ? Number.parseInt(value, 10) : typeof value === "number" ? value : NaN;
+  if (!Number.isFinite(raw)) return 2;
+  const normalized = Math.max(0, Math.min(3, Math.floor(raw)));
+  if (normalized === 0) return 0;
+  if (normalized === 1) return 1;
+  if (normalized === 2) return 2;
+  return 3;
+}
+
 type RunLogWriter = {
   log: CliLog;
   write: (text: string) => void;
@@ -759,11 +771,13 @@ async function streamRunProgress({
   store,
   startedAt,
   log,
+  verbosity,
 }: {
   runId: string;
   store: PostgresStore;
   startedAt: number;
   log: CliLog;
+  verbosity: VerbosityLevel;
 }) {
   const seenEvents = new Set<string>();
   let lastPhase = "";
@@ -771,11 +785,30 @@ async function streamRunProgress({
   let lastCheckpoint = "";
   let lastHeartbeat = 0;
 
+  const noisyEventTypes = new Set<string>([
+    "search_query_started",
+    "search_query_completed",
+    "search_result_candidate",
+    "source_fetch_started",
+    "source_fetch_completed",
+    "source_extract_started",
+    "source_extract_completed",
+  ]);
+
+  const shouldPrintEvent = (event: DbRunEvent): boolean => {
+    if (verbosity >= 3) return true;
+    if (event.level === "debug") return false;
+    if (verbosity <= 0) return event.level === "error";
+    if (verbosity === 1) return event.level === "warn" || event.level === "error";
+    if (noisyEventTypes.has(event.event_type) && event.level === "info") return false;
+    return true;
+  };
+
   while (true) {
     const [run, sources, events] = await Promise.all([
       store.getRun(runId) as Promise<DbRun | null>,
       store.listSources(runId) as Promise<DbSource[]>,
-      store.listRunEvents(runId, { limit: 40 }) as Promise<DbRunEvent[]>,
+      store.listRunEvents(runId, { limit: verbosity >= 3 ? 200 : 500 }) as Promise<DbRunEvent[]>,
     ]);
 
     if (!run) return;
@@ -788,30 +821,36 @@ async function streamRunProgress({
     for (const event of [...events].reverse()) {
       if (seenEvents.has(event.id)) continue;
       seenEvents.add(event.id);
+      if (!shouldPrintEvent(event)) continue;
       log(`[${elapsed}] ${eventLabel(event)}`);
     }
 
-    if (phase !== lastPhase) {
+    if (verbosity >= 2 && phase !== lastPhase) {
       log(`[${elapsed}] Step: ${phase}`);
       lastPhase = phase;
     }
 
-    if (sourceSummary !== lastSourceSummary) {
+    if (verbosity >= 2 && sourceSummary !== lastSourceSummary) {
       log(`[${elapsed}] Sources: ${sourceSummary}`);
       lastSourceSummary = sourceSummary;
     }
 
-    if (checkpoint !== lastCheckpoint) {
+    if (verbosity >= 2 && checkpoint !== lastCheckpoint) {
       log(`[${elapsed}] Counters: ${checkpoint}`);
       lastCheckpoint = checkpoint;
     }
 
     if (run.status !== "running" && run.status !== "queued") {
-      log(`[${elapsed}] Final status: ${run.status}`);
+      if (verbosity >= 1 || run.status === "failed") {
+        log(`[${elapsed}] Final status: ${run.status}`);
+      }
+      if (run.status === "failed") {
+        log(`[${elapsed}] Hint: openresearch resume ${runId}`);
+      }
       return;
     }
 
-    if (now - lastHeartbeat > 60000) {
+    if (verbosity >= 2 && now - lastHeartbeat > 60000) {
       const started = run.started_at ? ` started=${run.started_at}` : "";
       log(`[${elapsed}] Running${started} — ${phase} (${sourceSummary})`);
       lastHeartbeat = now;
@@ -829,6 +868,11 @@ program
   .option("--no-research-loop", "Disable the iterative research loop")
   .option("--debug-loop", "Print per-iteration research loop summaries", false)
   .option("--advanced", "Print intermediate artifact keys (advanced)", false)
+  .option(
+    "--verbosity <level>",
+    "Verbosity level (0=silent, 1=stats, 2=default, 3=debug)",
+    "2"
+  )
   .action(
     async (
       prompt: string,
@@ -837,8 +881,10 @@ program
         researchLoop: boolean;
         debugLoop: boolean;
         advanced: boolean;
+        verbosity: string;
       }
     ) => {
+      const verbosity = coerceVerbosityLevel(opts.verbosity);
       const config = await loadConfig();
       const { store, objectStore, services } = await buildServices(config);
       let commandError: unknown = null;
@@ -877,7 +923,7 @@ program
           runId: run.id,
           objectStore,
         });
-        pipelineLogWriter.log(`Run ID: ${run.id}`);
+        if (verbosity >= 1) pipelineLogWriter.log(`Run ID: ${run.id}`);
 
         const pipelineInput: Parameters<typeof runResearchPipeline>[0] = {
           runId: run.id,
@@ -888,15 +934,20 @@ program
           pipelineInput.debugCapture = { enabled: true, reason: "cli --debug-capture" };
 
         const runStart = Date.now();
-        await Promise.all([
-          runResearchPipeline(pipelineInput),
-          streamRunProgress({
-            runId: run.id,
-            store,
-            startedAt: runStart,
-            log: pipelineLogWriter.log,
-          }),
-        ]);
+        await Promise.all(
+          [
+            runResearchPipeline(pipelineInput),
+            verbosity >= 2
+              ? streamRunProgress({
+                  runId: run.id,
+                  store,
+                  startedAt: runStart,
+                  log: pipelineLogWriter.log,
+                  verbosity,
+                })
+              : null,
+          ].filter(Boolean)
+        );
 
         const md = await objectStore.getText(runOutputKey(run.id));
         if (md) pipelineLogWriter.write(md);
@@ -921,7 +972,7 @@ program
             modelCalls,
             verifiedClaims,
           });
-          printRunFinalStats({ summary, log: pipelineLogWriter.log });
+          if (verbosity >= 1) printRunFinalStats({ summary, log: pipelineLogWriter.log });
 
           if (opts.debugLoop || opts.advanced) {
             const state = finalRun.state as unknown;
@@ -1049,17 +1100,62 @@ program
 
 program
   .command("resume")
-  .description("Resume a run from the last checkpoint")
+  .description("Resume a run from the last checkpoint (default: via API)")
   .argument("<runId>", "Run ID")
-  .action(async (runId: string) => {
+  .option("--local", "Resume by running the pipeline locally (no API call)", false)
+  .option("--api-url <url>", "API base URL (or set OPENRESEARCH_API_URL)")
+  .option("--api-key <key>", "API key (or set OPENRESEARCH_API_KEY)")
+  .action(async (runId: string, opts: { local: boolean; apiUrl?: string; apiKey?: string }) => {
     const config = await loadConfig();
-    const { store, services } = await buildServices(config);
-    try {
-      await runResearchPipeline({ runId, config, services });
-      console.log(`Resumed: ${runId}`);
-    } finally {
-      await store.close();
+
+    if (opts.local) {
+      const { store, services } = await buildServices(config);
+      try {
+        await runResearchPipeline({ runId, config, services });
+        console.log(`Resumed locally: ${runId}`);
+      } finally {
+        await store.close();
+      }
+      return;
     }
+
+    const baseUrl =
+      (opts.apiUrl ?? process.env.OPENRESEARCH_API_URL ?? `http://127.0.0.1:${config.server.port}`).replace(
+        /\/+$/,
+        ""
+      );
+    const apiKey = opts.apiKey ?? process.env.OPENRESEARCH_API_KEY;
+    if (!apiKey) {
+      console.error("Missing API key. Provide --api-key or set OPENRESEARCH_API_KEY.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const res = await fetch(`${baseUrl}/runs/${runId}/resume`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+      },
+    });
+
+    const text = await res.text();
+    const body = (() => {
+      try {
+        return JSON.parse(text) as unknown;
+      } catch {
+        return text;
+      }
+    })();
+
+    if (!res.ok) {
+      console.error(body);
+      process.exitCode = 1;
+      return;
+    }
+
+    const jobId =
+      body && typeof body === "object" && !Array.isArray(body) && "jobId" in body ? (body as { jobId?: unknown }).jobId : null;
+    console.log(jobId ? `Resume enqueued: ${runId} (jobId=${String(jobId)})` : `Resume requested: ${runId}`);
   });
 
 program

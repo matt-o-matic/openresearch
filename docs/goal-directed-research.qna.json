@@ -1,0 +1,567 @@
+{
+  "version": 1,
+  "featureSlug": "goal-directed-research",
+  "updatedAt": "2026-02-17T04:26:05.314Z",
+  "rounds": [
+    {
+      "id": "round-1",
+      "title": "Round 1",
+      "questions": [
+        {
+          "id": "r1-q1",
+          "prompt": "Where should run checkpoints be persisted by default for local/CLI usage?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Filesystem under a per-user runs directory (e.g., ~/.openresearch/runs/<run-id>)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "SQLite database file managed by packages/storage",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Server-side Postgres only (API-managed), CLI becomes thin client",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "In-memory only (no persistence)",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Pluggable backend required; no default",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:04:00.154Z",
+              "selectedKey": "C",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q2",
+          "prompt": "When resuming a run, should we continue under the same run id or create a new run attempt?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Same run id; append iterations; record resumeCount/repair events in metadata",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "New run id with parentRunId pointing to the original",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "New run id and archive/lock the original run",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "No true resume; only rerun from scratch with copied config",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Same run id but overwrite prior iterations (destructive)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:04:04.777Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q3",
+          "prompt": "How should question completion be represented and used for stop criteria?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Tri-state (unanswered/partial/answered) plus evidence/confidence thresholds",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Binary answered/unanswered only",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Single numeric score (0–1) only",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Freeform notes only; no explicit status",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Only a global run-level done signal; no per-question tracking",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:04:20.649Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q4",
+          "prompt": "How should dependencies between questions be encoded and validated?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Extract an explicit DAG of question ids; validate acyclic; block until deps answered",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "No dependencies; always a flat list of questions",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Infer dependencies implicitly each iteration (no stored graph)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "User must provide dependencies manually",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Dependencies as prose only (not machine-validated)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:05:38.432Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q5",
+          "prompt": "What budgeting policy should be the default to avoid mid-finalize failures?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Per-iteration soft cap with a reserved finalize budget; stop between iterations when low",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Single global maxRuntimeMs that may stop mid-iteration or mid-finalize",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Hard per-iteration wall-clock kill (may interrupt synthesis)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Always finish the current iteration even if it exceeds budget",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "No runtime budget; only maxIterations",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:06:36.389Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            },
+            {
+              "id": "rev-2",
+              "createdAt": "2026-02-17T04:15:07.475Z",
+              "selectedKey": "D",
+              "notes": "To be clear what I mean by choosing D is that at the end of the current iteration it should then bypass the review and the gap analysis and just synthesize the final writing output into the result. By the time we get there we should already have a very refined result and if we're just out of time, that's fine. Try to do everything we can to land the plane cleanly. I don't want 'Hey we ran out of time, failure modes' but I also don't want this to go on forever, especially on a simple prompt.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q6",
+          "prompt": "How should synthesis context be managed for iteration N>1 to keep costs flat?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Carry forward a structured synthesis summary + include only new abstracts/deltas",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Carry forward all prior abstracts and the full prior synthesis",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Naive truncation: drop oldest tokens until within limits",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Only per-question summaries; no global synthesis summary",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "No compression; rely on model context window",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:06:59.472Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            },
+            {
+              "id": "rev-2",
+              "createdAt": "2026-02-17T04:08:27.971Z",
+              "selectedKey": "A",
+              "notes": "allow full context, but summarize if output budget is < 50,000 tokens. -- make this a feature flag. default A.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q7",
+          "prompt": "Where should question tracking and incomplete-section reporting appear in the final outputs?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Structured run output JSON metadata (questions, statuses, incompleteSections, lastCompletedIteration)",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "CLI logs only (not persisted in outputs)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Narrative report text only (no structured fields)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Internal only; not exposed to users",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Separate debug artifact file only",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:08:54.629Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q8",
+          "prompt": "What should the API resume authorization model be?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Only the run owner (same auth context) can resume; others receive 404/403",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Anyone with run id can resume",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Admin-only resume",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Disable API resume; support CLI-only resume",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Public share tokens can resume (link-based access)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:09:08.460Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q9",
+          "prompt": "How should this change be rolled out to protect existing behavior?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Feature flag or explicit mode switch (e.g., --mode goal-directed); default off initially",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Replace existing behavior immediately for all runs",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Enable automatically only when maxIterations > 1",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Enable for API runs only; keep CLI unchanged",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Enable only when prompt complexity exceeds a threshold",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:09:37.481Z",
+              "selectedKey": "B",
+              "notes": "nothing is released -- consider this green field.",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-2",
+      "title": "Round 2",
+      "questions": [
+        {
+          "id": "r2-q1",
+          "prompt": "For the “allow full context, but summarize if … < 50,000 tokens” rule, what token budget should the 50,000 threshold apply to?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Model context window (input+output max tokens)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Input prompt/context budget only (tokens we can send as context)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Max output tokens only (completion budget)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "An internal computed `contextBudgetTokens` (derived from model limits and requested output)",
+              "recommended": true
+            },
+            {
+              "key": "E",
+              "text": "Ignore the threshold; always summarize after iteration 1",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "D",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:20:33.354Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q2",
+          "prompt": "What default rubric should mark a core question as `answered` (vs `partial`) to drive stop criteria?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Direct answer + at least 1 credible citation/source",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Direct answer + at least 2 independent credible citations/sources",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Model confidence >= 0.8 + at least 1 citation/source",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "If gap analysis proposes no more follow-ups for it (citations optional)",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Only mark answered when all sub-questions are explicitly enumerated and addressed",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:21:00.262Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q3",
+          "prompt": "What should be included in each Postgres checkpoint payload to support resume without re-fetching?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Derived artifacts: seenUrls/queries, per-source abstracts/notes, synthesis snapshot+summary, question graph/statuses",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Minimal state only: seenUrls/queries + synthesis summary + question statuses (no source-level artifacts)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Only synthesis snapshot/summary + question statuses (no seenUrls/queries)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Everything including raw fetched documents (HTML/text) for fully offline resume",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Only the latest checkpoint (overwrite previous) to minimize DB growth",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:21:32.096Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q4",
+          "prompt": "What should `POST /runs/:id/resume` do if the run is already running/queued?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Idempotent: return current status and do not enqueue duplicate work",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Enqueue another resume job and rely on workers to dedupe later",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Cancel current work and restart from the latest checkpoint",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Return 409 Conflict and require the client to wait",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-17T04:21:49.098Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-3",
+      "title": "Round 3 (complete)",
+      "questions": []
+    }
+  ],
+  "notes": ""
+}

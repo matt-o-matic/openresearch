@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { BudgetConfig, PhaseModelConfig, ResearchLoopConfig, ThinkingMode } from "./config.js";
 import type { HttpFetchAdapter, SearchAdapter } from "./adapters.js";
@@ -322,7 +322,7 @@ describe("runResearchLoop", () => {
         return out;
       },
       callModelJsonLogged: async <T>() => {
-        const out: GapAnalysisOutput = { nextQueries: ["q-next"], nextTasks: [], stop: false };
+        const out: GapAnalysisOutput = { questionUpdates: [], nextQueries: ["q-next"], nextTasks: [], stop: false };
         return out as unknown as T;
       },
     };
@@ -395,7 +395,13 @@ describe("runResearchLoop", () => {
         return out;
       },
       callModelJsonLogged: async <T>() => {
-        const out: GapAnalysisOutput = { nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
+        const out: GapAnalysisOutput = {
+          questionUpdates: [],
+          nextQueries: [],
+          nextTasks: [],
+          stop: true,
+          stopReason: "complete",
+        };
         return out as unknown as T;
       },
     };
@@ -472,8 +478,8 @@ describe("runResearchLoop", () => {
         callCount += 1;
         const out: GapAnalysisOutput =
           callCount === 1
-            ? { nextQueries: ["q-next"], nextTasks: [], stop: false, stopReason: "" }
-            : { nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
+            ? { questionUpdates: [], nextQueries: ["q-next"], nextTasks: [], stop: false, stopReason: "" }
+            : { questionUpdates: [], nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
         return out as unknown as T;
       },
     };
@@ -551,8 +557,8 @@ describe("runResearchLoop", () => {
         callCount += 1;
         const out: GapAnalysisOutput =
           callCount === 1
-            ? { nextQueries: ["q-next"], nextTasks: [], stop: false, stopReason: "   " }
-            : { nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
+            ? { questionUpdates: [], nextQueries: ["q-next"], nextTasks: [], stop: false, stopReason: "   " }
+            : { questionUpdates: [], nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
         return out as unknown as T;
       },
     };
@@ -620,7 +626,7 @@ describe("runResearchLoop", () => {
         return out;
       },
       callModelJsonLogged: async <T>() => {
-        const out: GapAnalysisOutput = { nextQueries: [], nextTasks: [], stop: true, stopReason: "" };
+        const out: GapAnalysisOutput = { questionUpdates: [], nextQueries: [], nextTasks: [], stop: true, stopReason: "" };
         return out as unknown as T;
       },
     };
@@ -693,7 +699,13 @@ describe("runResearchLoop", () => {
         return out;
       },
       callModelJsonLogged: async <T>() => {
-        const out: GapAnalysisOutput = { nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
+        const out: GapAnalysisOutput = {
+          questionUpdates: [],
+          nextQueries: [],
+          nextTasks: [],
+          stop: true,
+          stopReason: "complete",
+        };
         return out as unknown as T;
       },
     };
@@ -775,8 +787,8 @@ describe("runResearchLoop", () => {
         gapCall += 1;
         const out: GapAnalysisOutput =
           gapCall === 1
-            ? { nextQueries: ["q2"], nextTasks: [], stop: false }
-            : { nextQueries: [], nextTasks: [], stop: false };
+            ? { questionUpdates: [], nextQueries: ["q2"], nextTasks: [], stop: false }
+            : { questionUpdates: [], nextQueries: [], nextTasks: [], stop: false };
         return out as unknown as T;
       },
     };
@@ -847,7 +859,13 @@ describe("runResearchLoop", () => {
         return out;
       },
       callModelJsonLogged: async <T>() => {
-        const out: GapAnalysisOutput = { nextQueries: [], nextTasks: [], stop: true, stopReason: "complete" };
+        const out: GapAnalysisOutput = {
+          questionUpdates: [],
+          nextQueries: [],
+          nextTasks: [],
+          stop: true,
+          stopReason: "complete",
+        };
         return out as unknown as T;
       },
     };
@@ -934,7 +952,12 @@ describe("runResearchLoop", () => {
       },
       callModelJsonLogged: async <T>() => {
         gapCall += 1;
-        const out: GapAnalysisOutput = { nextQueries: [`q${gapCall + 1}`], nextTasks: [], stop: false };
+        const out: GapAnalysisOutput = {
+          questionUpdates: [],
+          nextQueries: [`q${gapCall + 1}`],
+          nextTasks: [],
+          stop: false,
+        };
         return out as unknown as T;
       },
     };
@@ -973,7 +996,7 @@ describe("runResearchLoop", () => {
     expect(synthesizePreviousProvided[0]).toBe(false);
     expect(synthesizePreviousProvided[1]).toBe(true);
     expect(synthesizePreviousProvided[2]).toBe(true);
-    expect(synthesizePreviousProvided[3]).toBe(false);
+    expect(synthesizePreviousProvided[3]).toBe(true);
 
     expect(retrieveSeenSizes[0]).toBe(0);
     expect(retrieveSeenSizes[1]).toBeGreaterThan(0);
@@ -1027,7 +1050,7 @@ describe("runResearchLoop", () => {
         return out;
       },
       callModelJsonLogged: async <T>() => {
-        const out: GapAnalysisOutput = { nextQueries: [], nextTasks: [], stop: false };
+        const out: GapAnalysisOutput = { questionUpdates: [], nextQueries: [], nextTasks: [], stop: false };
         return out as unknown as T;
       },
     };
@@ -1096,5 +1119,281 @@ describe("runResearchLoop", () => {
     expect(retrieveCalls).toBe(1);
     expect(createSourceCalls).toBe(1);
     expect(fetchCalls).toBe(2);
+  });
+
+  it("stops with questions_answered when all questions are answered with evidence", async () => {
+    const runId = "run-questions-answered";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    checkpoint.questionGraph = {
+      validated: true,
+      questions: [
+        { id: "q1", text: "Question 1", dependsOn: [], status: "unanswered", evidence: [] },
+        { id: "q2", text: "Question 2", dependsOn: [], status: "unanswered", evidence: [] },
+      ],
+    };
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let gapCalls = 0;
+
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        const out: RetrievalOutput = { queries: [], selectedUrls: ["https://example.com/src-1"] };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({ summary: "iteration synthesis", sources: input.sources, findingId: "F1" });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        const out: GapAnalysisOutput = {
+          questionUpdates: [
+            { id: "q1", status: "answered", evidence: [{ source: "S1" }] },
+            { id: "q2", status: "answered", evidence: [{ source: "S1" }] },
+          ],
+          nextQueries: ["should be ignored"],
+          nextTasks: [],
+          stop: false,
+        };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 5 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("questions_answered");
+    expect(gapCalls).toBe(1);
+    expect(checkpoint.questionGraph?.questions.every((q) => q.status === "answered")).toBe(true);
+  });
+
+  it("respects question dependencies and unlocks answers across iterations", async () => {
+    const runId = "run-question-deps";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    checkpoint.questionGraph = {
+      validated: true,
+      questions: [
+        { id: "q1", text: "Question 1", dependsOn: [], status: "unanswered", evidence: [] },
+        { id: "q2", text: "Question 2", dependsOn: ["q1"], status: "unanswered", evidence: [] },
+      ],
+    };
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let retrieveCalls = 0;
+    let gapCalls = 0;
+
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        retrieveCalls += 1;
+        const out: RetrievalOutput = {
+          queries: [],
+          selectedUrls: [`https://example.com/src-${retrieveCalls}`],
+        };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({ summary: "iteration synthesis", sources: input.sources, findingId: "F1" });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        if (gapCalls === 1) {
+          const out: GapAnalysisOutput = {
+            questionUpdates: [
+              { id: "q1", status: "answered", evidence: [{ source: "S1" }] },
+              { id: "q2", status: "answered", evidence: [{ source: "S1" }] },
+            ],
+            nextQueries: ["q-next"],
+            nextTasks: [],
+            stop: false,
+          };
+          return out as unknown as T;
+        }
+
+        const out: GapAnalysisOutput = {
+          questionUpdates: [{ id: "q2", status: "answered", evidence: [{ source: "S1" }] }],
+          nextQueries: [],
+          nextTasks: [],
+          stop: false,
+        };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 2 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("questions_answered");
+    expect(retrieveCalls).toBe(2);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.updatedAtIteration).toBe(1);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q2")?.updatedAtIteration).toBe(2);
+  });
+
+  it("lands the plane under time pressure by skipping review/gap-analysis", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+      const runId = "run-land-the-plane";
+      const userId = "user";
+      const prompt = "Test prompt";
+      const checkpoint = baseCheckpoint(runId);
+      const objectStore = new MemoryObjectStore();
+
+      await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+      const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+      const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+      let reviewCalls = 0;
+      let gapCalls = 0;
+
+      const steps: LoopSteps = {
+        retrieve: async () => {
+          const out: RetrievalOutput = { queries: [], selectedUrls: ["https://example.com/src-1"] };
+          return out;
+        },
+        fetch: async () => {
+          vi.advanceTimersByTime(2_000);
+        },
+        extract: async () => {},
+        loadLabeledSources: async (input) => {
+          const sources = await input.store.listSources(runId);
+          return labeledSourcesFromStore(input.checkpoint, sources);
+        },
+        synthesize: async (input) => {
+          return synthesisSnapshot({ summary: "iteration synthesis", sources: input.sources, findingId: "F1" });
+        },
+        review: async () => {
+          reviewCalls += 1;
+          const out: IterationReviewOutput = {
+            verdict: "accept",
+            unsupportedConclusions: [],
+            missingEvidence: [],
+            requestedRevisions: [],
+          };
+          return out;
+        },
+        callModelJsonLogged: async <T>() => {
+          gapCalls += 1;
+          const out: GapAnalysisOutput = {
+            questionUpdates: [],
+            nextQueries: ["q-next"],
+            nextTasks: [],
+            stop: false,
+          };
+          return out as unknown as T;
+        },
+      };
+
+      const result = await runResearchLoop({
+        runId,
+        userId,
+        prompt,
+        citationPolicy,
+        budgets: baseBudgetConfig({ maxSources: 10 }),
+        models: baseModels(),
+        thinkingMode,
+        loopConfig: baseLoopConfig({ maxIterations: 5 }),
+        deadlineMs: Date.now() + 31_000,
+        services: makeStaticServices({ store, objectStore, modelProvider }),
+        checkpoint,
+        synthesis: {
+          maxInputTokens: 120_000,
+          maxOutputTokens: 5_000,
+          contextWindowTokens: 120_000,
+          requestedMaxInputTokens: 120_000,
+          requestedMaxOutputTokens: 5_000,
+        },
+        steps,
+      });
+
+      expect(result.stopReason).toBe("budget_exhausted");
+      expect(reviewCalls).toBe(0);
+      expect(gapCalls).toBe(0);
+      expect(await objectStore.getJson(runSynthesisKey(runId))).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

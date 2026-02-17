@@ -45,6 +45,8 @@ import {
 } from "./artifacts.js";
 import type { CitationMap, LabeledSource, SynthesisOutput } from "./memo.js";
 import { buildCitationMap, renderResearchMemoMarkdown, SynthesisOutputSchema } from "./memo.js";
+import { QuestionGraphSchema, validateQuestionGraph } from "./goal-directed.js";
+import type { QuestionGraph, SynthesisState } from "./goal-directed.js";
 import { validateCitations } from "./verify.js";
 import { runResearchLoop, type ResearchLoopCheckpointState } from "./research-loop.js";
 import { normalizeUrl } from "./url.js";
@@ -72,6 +74,8 @@ export type RunCheckpoint = {
   sourceIds?: string[];
   sourceLabels?: Record<string, string>; // sourceId -> label
   researchLoop?: ResearchLoopCheckpointState;
+  questionGraph?: QuestionGraph;
+  synthesisState?: SynthesisState;
   artifacts: {
     planKey?: string;
     retrievalKey?: string;
@@ -192,6 +196,21 @@ export interface PipelineStore {
     quoteStart?: number;
     quoteEnd?: number;
   }): Promise<unknown>;
+
+  createRunCheckpoint?: (input: {
+    runId: string;
+    kind: "iteration" | "finalize";
+    checkpointVersion: number;
+    iterationCompleted: number;
+    payload: unknown;
+  }) => Promise<unknown>;
+
+  listRunCheckpoints?: (
+    runId: string,
+    opts?: { limit?: number }
+  ) => Promise<unknown[]>;
+
+  getLatestValidRunCheckpoint?: (runId: string) => Promise<unknown | null>;
 }
 
 export interface ObjectStore {
@@ -222,6 +241,18 @@ const PlanPassSchema = PlanOutputSchema.extend({
 });
 type PlanPass = z.infer<typeof PlanPassSchema>;
 type PlanOutput = z.infer<typeof PlanOutputSchema>;
+
+const QuestionExtractionModelSchema = z.object({
+  questions: z
+    .array(
+      z.object({
+        text: z.string().min(1),
+        dependsOn: z.array(z.string().min(1)).default([]),
+      })
+    )
+    .min(1),
+});
+type QuestionExtractionModelOutput = z.infer<typeof QuestionExtractionModelSchema>;
 
 type PlanTodoItem = {
   index: number;
@@ -260,6 +291,250 @@ function safeParseCheckpoint(state: unknown | null): RunCheckpoint {
     artifacts: { ...initialCheckpoint().artifacts, ...(c.artifacts ?? {}) },
     debug: { ...initialCheckpoint().debug, ...(c.debug ?? {}) },
   };
+}
+
+function buildFallbackQuestionGraph(input: { prompt: string; plan?: PlanOutput | null }): QuestionGraph {
+  const raw =
+    input.plan && Array.isArray(input.plan.subquestions) && input.plan.subquestions.length > 0
+      ? input.plan.subquestions
+      : [input.prompt];
+  const questions = raw
+    .map((text) => (typeof text === "string" ? text.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((text, i) => ({
+      id: `q${i + 1}`,
+      text,
+      dependsOn: [],
+      status: "unanswered" as const,
+      evidence: [],
+    }));
+  return QuestionGraphSchema.parse({ validated: true, questions });
+}
+
+function normalizeExtractedQuestionGraph(input: {
+  raw: QuestionExtractionModelOutput;
+  fallback: QuestionGraph;
+}): QuestionGraph {
+  const maxQuestions = 10;
+  const trimmed = input.raw.questions
+    .map((q) => ({
+      text: typeof q.text === "string" ? q.text.trim() : "",
+      dependsOn: Array.isArray(q.dependsOn) ? q.dependsOn : [],
+    }))
+    .filter((q) => Boolean(q.text))
+    .slice(0, maxQuestions);
+
+  if (trimmed.length === 0) return input.fallback;
+
+  const ids = trimmed.map((_q, i) => `q${i + 1}`);
+  const idSet = new Set(ids);
+
+  const questions = trimmed.map((q, i) => {
+    const deps = q.dependsOn
+      .map((dep) => (typeof dep === "string" ? dep.trim() : ""))
+      .filter((dep) => /^q[0-9]+$/.test(dep))
+      .filter((dep) => idSet.has(dep))
+      .filter((dep) => dep !== ids[i]);
+
+    return {
+      id: ids[i]!,
+      text: q.text,
+      dependsOn: Array.from(new Set(deps)),
+      status: "unanswered" as const,
+      evidence: [],
+    };
+  });
+
+  return validateQuestionGraph(
+    QuestionGraphSchema.parse({
+      validated: false,
+      questions,
+    })
+  );
+}
+
+function hasStrongDependencyCue(text: string): boolean {
+  const t = text.toLowerCase();
+  return /\b(given|based on|using|from the answer|after answering|derive|calculate|compute|prove|verify)\b/.test(t);
+}
+
+function maxDependencyDepth(questions: Array<{ id: string; dependsOn: string[] }>): number {
+  const byId = new Map(questions.map((q) => [q.id, q]));
+  const memo = new Map<string, number>();
+
+  const depthFrom = (id: string): number => {
+    const cached = memo.get(id);
+    if (cached !== undefined) return cached;
+    const q = byId.get(id);
+    if (!q || q.dependsOn.length === 0) {
+      memo.set(id, 0);
+      return 0;
+    }
+    let max = 0;
+    for (const dep of q.dependsOn) {
+      max = Math.max(max, 1 + depthFrom(dep));
+    }
+    memo.set(id, max);
+    return max;
+  };
+
+  let max = 0;
+  for (const q of questions) {
+    max = Math.max(max, depthFrom(q.id));
+  }
+  return max;
+}
+
+function tuneQuestionDependencies(graph: QuestionGraph): {
+  graph: QuestionGraph;
+  pruned: boolean;
+  reason: string | null;
+  stats: {
+    totalQuestions: number;
+    dependentQuestions: number;
+    edgeCount: number;
+    maxDepth: number;
+    hasStrongCue: boolean;
+  };
+} {
+  const totalQuestions = graph.questions.length;
+  const dependentQuestions = graph.questions.filter((q) => q.dependsOn.length > 0).length;
+  const edgeCount = graph.questions.reduce((sum, q) => sum + q.dependsOn.length, 0);
+  const maxDepth = maxDependencyDepth(graph.questions);
+  const hasStrongCue = graph.questions.some((q) => hasStrongDependencyCue(q.text));
+
+  const dependencyHeavy =
+    dependentQuestions >= Math.max(3, Math.ceil(totalQuestions * 0.75)) && edgeCount >= dependentQuestions;
+  const overspecified = maxDepth >= 2 || dependencyHeavy;
+
+  if (!overspecified || hasStrongCue || edgeCount === 0) {
+    return {
+      graph,
+      pruned: false,
+      reason: null,
+      stats: { totalQuestions, dependentQuestions, edgeCount, maxDepth, hasStrongCue },
+    };
+  }
+
+  const flattened = validateQuestionGraph({
+    validated: false,
+    questions: graph.questions.map((q) => ({ ...q, dependsOn: [] })),
+  });
+  return {
+    graph: flattened,
+    pruned: true,
+    reason: "pruned_overspecified_dependencies",
+    stats: { totalQuestions, dependentQuestions, edgeCount, maxDepth, hasStrongCue },
+  };
+}
+
+async function extractQuestionGraphFromPrompt(input: {
+  runId: string;
+  userId: string;
+  prompt: string;
+  plan: PlanOutput | null;
+  provider: ModelProvider | undefined;
+  model: string;
+  thinkingMode: ThinkingMode;
+  store: PipelineStore;
+  objectStore: ObjectStore;
+  checkpoint: RunCheckpoint;
+}): Promise<QuestionGraph> {
+  const fallback = buildFallbackQuestionGraph({
+    prompt: input.prompt,
+    ...(input.plan ? { plan: input.plan } : {}),
+  });
+  if (!input.provider) return fallback;
+
+  const sys: ChatMessage = {
+    role: "system",
+    content:
+      "Extract the core questions implied by the prompt. Prefer a flat list (no dependencies). " +
+      "Only add dependsOn when a question truly cannot be answered without first answering another question. " +
+      "Avoid serializing parallel sub-questions behind a single root question. Output JSON only.",
+  };
+  const user: ChatMessage = {
+    role: "user",
+    content: JSON.stringify({
+      task: "Extract core questions (optionally with dependencies).",
+      prompt: input.prompt,
+      planningContext: {
+        subquestions: input.plan?.subquestions ?? [],
+        queries: input.plan?.queries ?? [],
+      },
+      outputSchema: {
+        questions: [
+          {
+            text: "Question text",
+            dependsOn: ["q1"],
+          },
+        ],
+      },
+      constraints: {
+        maxQuestions: 10,
+        dependencyRules: [
+          "Prefer dependsOn: []. Use dependencies sparingly.",
+          "Use ids q1..qN in dependsOn.",
+          "Do not create cycles.",
+          "Only depend on earlier questions when possible.",
+          "Avoid long chains (e.g., q3->q2->q1) unless required by the question wording.",
+          "If questions can be answered independently from the same sources, do not add dependencies.",
+        ],
+      },
+    }),
+  };
+
+  try {
+    const raw = await callModelJsonLogged({
+      runId: input.runId,
+      userId: input.userId,
+      phase: "plan",
+      persona: "question-extraction",
+      provider: input.provider,
+      model: input.model,
+      messages: [sys, user],
+      schema: QuestionExtractionModelSchema,
+      reasoningEffort: input.thinkingMode,
+      store: input.store,
+      objectStore: input.objectStore,
+      checkpoint: input.checkpoint,
+      promptVersion: "question-extraction.v1",
+      maxTokens: 2_000,
+    });
+
+    const normalized = normalizeExtractedQuestionGraph({ raw, fallback });
+    const tuned = tuneQuestionDependencies(normalized);
+    if (tuned.pruned) {
+      await input.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "plan",
+          eventType: "question_graph_dependencies_pruned",
+          message:
+            "Pruned overspecified question dependencies to keep questions parallelizable " +
+            `(dependentQuestions=${tuned.stats.dependentQuestions}/${tuned.stats.totalQuestions}, maxDepth=${tuned.stats.maxDepth})`,
+          data: tuned,
+        })
+        .catch(() => {});
+    }
+    return tuned.graph;
+  } catch (err) {
+    await input.store
+      .addRunEvent({
+        runId: input.runId,
+        level: "warn",
+        phase: "plan",
+        eventType: "question_graph_extraction_failed",
+        message: "Question graph extraction failed; falling back to flat questions",
+        data: {
+          error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+        },
+      })
+      .catch(() => {});
+    return fallback;
+  }
 }
 
 function buildPlanTodoItems(
@@ -1222,7 +1497,7 @@ const SYNTHESIS_MIN_OUTPUT_TOKENS = 1;
 const SYNTHESIS_MAX_QUOTES_PER_SOURCE = 3;
 const SYNTHESIS_MAX_CLAIM_LENGTH = 320;
 const CLAIM_SIMILARITY_RATIO = 0.82;
-const SYNTHESIS_MAX_SOURCES_FOR_MODEL = 20;
+const SYNTHESIS_MAX_SOURCES_FOR_MODEL = 10;
 const SYNTHESIS_MIN_PROMPT_TERM_SCORE = 0.08;
 const SYNTHESIS_TARGET_MIN_SUMMARY_WORDS = 320;
 const SYNTHESIS_REFINEMENT_MAX_RETRIES = 3;
@@ -1326,13 +1601,13 @@ const SYNTHESIS_SOURCE_ABSTRACT_SYSTEM_PROMPT =
   "Create concise source synthesis abstracts that capture methodology, temporal context, stakeholder position, and key constraints that limit inference.\n" +
   "Return strict JSON only. Do not use markdown, code fences, comments, or prose.\n" +
   "Output must be exactly this shape:\n" +
-  '{ \"sourceAbstracts\": [ { \"source\": \"S1\", \"methodology\": \"...\", \"temporalContext\": \"...\", \"dataTypes\": [\"...\"], \"stakeholderPosition\": \"...\", \"representativeClaims\": [\"...\"], \"keyConstraints\": [\"...\"] } ], \"synthesisNotes\": [\"...\"] }.\n' +
+  '{ "sourceAbstracts": [ { "source": "S1", "methodology": "...", "temporalContext": "...", "dataTypes": ["..."], "stakeholderPosition": "...", "representativeClaims": ["..."], "keyConstraints": ["..."] } ], "synthesisNotes": ["..."] }.\n' +
   "Required keys for each sourceAbstract: source (string), methodology (string), temporalContext (string), dataTypes (string[]), stakeholderPosition (string), representativeClaims (string[]), keyConstraints (string[]).\n" +
   "All string fields must be non-empty after trimming and all arrays should be omitted only if empty.";
 
 const SYNTHESIS_SYSTEM_REVIEW_SCHEMA_PROMPT =
   " Return strict JSON only in the exact shape:\n" +
-  '{ \"verdict\": \"accept|revise|reject\", \"unsupportedConclusions\": [ { \"findingId\": \"string\", \"issue\": \"string\", \"why\": \"string\", \"strengtheningAlternative\": \"string\" } ], \"missingEvidence\": [\"string\"], \"requestedRevisions\": [\"string\"], \"confidenceRisk\": 0|1|...|10 }\n' +
+  '{ "verdict": "accept|revise|reject", "unsupportedConclusions": [ { "findingId": "string", "issue": "string", "why": "string", "strengtheningAlternative": "string" } ], "missingEvidence": ["string"], "requestedRevisions": ["string"], "confidenceRisk": 0|1|...|10 }\n' +
   "Do not use alternate keys like summaryIssues/keyFindingsIssues/recommendationsIssues. All strings must be non-empty and arrays may be empty.";
 
 const SYNTHESIS_SYSTEM_REVIEW_PROMPT_WITH_SCHEMA =
@@ -1425,6 +1700,7 @@ function coerceResearchLoopConfig(v: unknown, fallback: ResearchLoopConfig): Res
     sourcesPerIteration?: unknown;
     mode?: unknown;
     switchToHybridAfterRejects?: unknown;
+    fullContext?: unknown;
   };
 
   const enabled = typeof o.enabled === "boolean" ? o.enabled : fallback.enabled;
@@ -1434,6 +1710,7 @@ function coerceResearchLoopConfig(v: unknown, fallback: ResearchLoopConfig): Res
     o.switchToHybridAfterRejects,
     fallback.switchToHybridAfterRejects
   );
+  const fullContext = typeof o.fullContext === "boolean" ? o.fullContext : fallback.fullContext === true;
 
   const sourcesPerIteration =
     typeof o.sourcesPerIteration === "number" &&
@@ -1448,6 +1725,7 @@ function coerceResearchLoopConfig(v: unknown, fallback: ResearchLoopConfig): Res
     maxIterations,
     mode,
     switchToHybridAfterRejects,
+    fullContext,
     ...(sourcesPerIteration !== undefined ? { sourcesPerIteration } : {}),
   };
 }
@@ -1733,6 +2011,50 @@ export async function runResearchPipeline(input: {
           await input.services.objectStore.putJson(planKey, plan);
           await input.services.store.updateRun({ runId: run.id, plan });
         }
+
+        if (!checkpoint.questionGraph) {
+          const questionGraph = await extractQuestionGraphFromPrompt({
+            runId: run.id,
+            userId: run.user_id,
+            prompt: run.prompt,
+            plan: plan,
+            provider: input.services.modelProvider,
+            model: modelRouter.modelForPhase("plan"),
+            thinkingMode,
+            store: input.services.store,
+            objectStore: input.services.objectStore,
+            checkpoint,
+          });
+          checkpoint.questionGraph = questionGraph;
+          await input.services.store.updateRun({ runId: run.id, state: checkpoint });
+          await input.services.objectStore
+            .putJson(runArtifactKey(run.id, "question-graph.json"), questionGraph)
+            .catch(() => {});
+          await input.services.store
+            .addRunEvent({
+              runId: run.id,
+              level: "info",
+              phase: "plan",
+              eventType: "question_graph_ready",
+              message: (() => {
+                const deps = questionGraph.questions
+                  .filter((q) => q.dependsOn.length > 0)
+                  .map((q) => `${q.id}<-(${q.dependsOn.join(",")})`);
+                const depLine = deps.length ? `\n  Dependencies: ${deps.join(" ")}` : "";
+                return `Core question graph ready (questions=${questionGraph.questions.length}, validated=${questionGraph.validated})${depLine}`;
+              })(),
+              data: {
+                questionCount: questionGraph.questions.length,
+                validated: questionGraph.validated,
+                questions: questionGraph.questions.map((q) => ({
+                  id: q.id,
+                  text: q.text,
+                  dependsOn: q.dependsOn,
+                })),
+              },
+            })
+            .catch(() => {});
+        }
         checkpoint.artifacts.planKey = planKey;
         checkpoint.nextPhase = "retrieve";
         await input.services.store.updateRun({
@@ -1952,95 +2274,341 @@ export async function runResearchPipeline(input: {
 
       if (phase === "verify") {
         await markPhase("verify");
-        const sources = await loadLabeledSources({
-          runId: run.id,
-          checkpoint,
-          store: input.services.store,
-          objectStore: input.services.objectStore,
-        });
-        const synthesis = await input.services.objectStore.getJson<SynthesisOutput>(
-          checkpoint.artifacts.synthesisKey!
-        );
-        if (!synthesis) throw new Error("Missing synthesis artifact");
+        try {
+          const sources = await loadLabeledSources({
+            runId: run.id,
+            checkpoint,
+            store: input.services.store,
+            objectStore: input.services.objectStore,
+          }).catch(() => []);
 
-        const citationMap = buildCitationMap({
-          runId: run.id,
-          policy: citationPolicy,
-          synthesis,
-          sources,
-        });
-        const evidenceBySourceId: Record<string, ExtractedEvidence | undefined> = {};
-        for (const s of sources) {
-          const ev = await input.services.objectStore.getJson<ExtractedEvidence>(
-            sourceEvidenceKey(run.id, s.sourceId)
-          );
-          evidenceBySourceId[s.sourceId] = ev ?? undefined;
-        }
+          const synthesisKeyCandidates: string[] = [];
+          const pushKey = (key: unknown) => {
+            if (typeof key === "string" && key.trim()) synthesisKeyCandidates.push(key.trim());
+          };
+          pushKey(checkpoint.artifacts.synthesisKey);
+          pushKey(checkpoint.synthesisState?.snapshotKey);
+          pushKey(runSynthesisKey(run.id));
+          pushKey(checkpoint.researchLoop?.lastSynthesisKey);
+          const lastIterationSynthesisKey = checkpoint.researchLoop?.iterations
+            ?.slice()
+            .sort((a, b) => a.iteration - b.iteration)
+            .at(-1)?.artifacts.synthesisKey;
+          pushKey(lastIterationSynthesisKey);
 
-        const { report, markdown } = validateCitations({
-          runId: run.id,
-          policy: citationPolicy,
-          citationMap,
-          evidenceBySourceId,
-        });
-
-        const citationMapKey = checkpoint.artifacts.citationMapKey ?? runCitationMapKey(run.id);
-        const verificationJsonKey =
-          checkpoint.artifacts.verificationJsonKey ?? runVerificationJsonKey(run.id);
-        const verificationMarkdownKey =
-          checkpoint.artifacts.verificationMarkdownKey ?? runVerificationMarkdownKey(run.id);
-
-        await input.services.objectStore.putJson(citationMapKey, citationMap);
-        await input.services.objectStore.putJson(verificationJsonKey, report);
-        await input.services.objectStore.putText(verificationMarkdownKey, markdown);
-
-        // Persist citations table (best-effort)
-        for (const claim of citationMap.claims) {
-          for (const cit of claim.citations) {
-            await input.services.store.addCitation({
-              runId: run.id,
-              claimId: claim.id,
-              sourceId: cit.sourceId,
-              ...(cit.quote ? { quoteStart: cit.quote.start, quoteEnd: cit.quote.end } : {}),
-            });
+          const dedupedSynthesisKeys = Array.from(new Set(synthesisKeyCandidates));
+          let synthesis: SynthesisOutput | null = null;
+          let synthesisKeyUsed: string | null = null;
+          for (const key of dedupedSynthesisKeys) {
+            const raw = await input.services.objectStore.getJson<unknown>(key);
+            if (!raw) continue;
+            const parsed = SynthesisOutputSchema.safeParse(raw);
+            if (!parsed.success) continue;
+            synthesis = parsed.data;
+            synthesisKeyUsed = key;
+            break;
           }
-        }
 
-        checkpoint.artifacts.citationMapKey = citationMapKey;
-        checkpoint.artifacts.verificationJsonKey = verificationJsonKey;
-        checkpoint.artifacts.verificationMarkdownKey = verificationMarkdownKey;
-        checkpoint.nextPhase = "finalize";
-        await input.services.store.updateRun({
-          runId: run.id,
-          phase: "finalize",
-          state: checkpoint,
-        });
+          if (!synthesis) {
+            await input.services.store
+              .addRunEvent({
+                runId: run.id,
+                level: "warn",
+                phase: "verify",
+                eventType: "verify_skipped_missing_synthesis",
+                message:
+                  "Skipping verify phase due to missing/invalid synthesis; finalizing best-effort output",
+                data: { synthesisKeyCandidates: dedupedSynthesisKeys },
+              })
+              .catch(() => {});
+          } else {
+            if (synthesisKeyUsed) checkpoint.artifacts.synthesisKey = synthesisKeyUsed;
+
+            const citationMap = buildCitationMap({
+              runId: run.id,
+              policy: citationPolicy,
+              synthesis,
+              sources,
+            });
+            const evidenceBySourceId: Record<string, ExtractedEvidence | undefined> = {};
+            for (const s of sources) {
+              const ev = await input.services.objectStore.getJson<ExtractedEvidence>(
+                sourceEvidenceKey(run.id, s.sourceId)
+              );
+              evidenceBySourceId[s.sourceId] = ev ?? undefined;
+            }
+
+            const { report, markdown } = validateCitations({
+              runId: run.id,
+              policy: citationPolicy,
+              citationMap,
+              evidenceBySourceId,
+            });
+
+            const citationMapKey = checkpoint.artifacts.citationMapKey ?? runCitationMapKey(run.id);
+            const verificationJsonKey =
+              checkpoint.artifacts.verificationJsonKey ?? runVerificationJsonKey(run.id);
+            const verificationMarkdownKey =
+              checkpoint.artifacts.verificationMarkdownKey ?? runVerificationMarkdownKey(run.id);
+
+            await input.services.objectStore.putJson(citationMapKey, citationMap);
+            await input.services.objectStore.putJson(verificationJsonKey, report);
+            await input.services.objectStore.putText(verificationMarkdownKey, markdown);
+
+            // Persist citations table (best-effort)
+            try {
+              for (const claim of citationMap.claims) {
+                for (const cit of claim.citations) {
+                  await input.services.store.addCitation({
+                    runId: run.id,
+                    claimId: claim.id,
+                    sourceId: cit.sourceId,
+                    ...(cit.quote ? { quoteStart: cit.quote.start, quoteEnd: cit.quote.end } : {}),
+                  });
+                }
+              }
+            } catch (err) {
+              await input.services.store
+                .addRunEvent({
+                  runId: run.id,
+                  level: "warn",
+                  phase: "verify",
+                  eventType: "citation_persist_failed",
+                  message: "Failed to persist some citations; continuing",
+                  data: { error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err) },
+                })
+                .catch(() => {});
+            }
+
+            checkpoint.artifacts.citationMapKey = citationMapKey;
+            checkpoint.artifacts.verificationJsonKey = verificationJsonKey;
+            checkpoint.artifacts.verificationMarkdownKey = verificationMarkdownKey;
+          }
+
+          checkpoint.nextPhase = "finalize";
+          await input.services.store.updateRun({ runId: run.id, phase: "finalize", state: checkpoint });
+        } catch (err) {
+          await input.services.store
+            .addRunEvent({
+              runId: run.id,
+              level: "error",
+              phase: "verify",
+              eventType: "verify_failed_best_effort",
+              message: "Verify encountered an unexpected error; continuing to finalize",
+              data: { error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err) },
+            })
+            .catch(() => {});
+          checkpoint.nextPhase = "finalize";
+          await input.services.store
+            .updateRun({ runId: run.id, phase: "finalize", state: checkpoint })
+            .catch(() => {});
+        }
         await completePhase("verify");
       }
 
       if (phase === "finalize") {
         await markPhase("finalize");
-        const citationMap = await input.services.objectStore.getJson<CitationMap>(
-          checkpoint.artifacts.citationMapKey!
-        );
-        const synthesis = await input.services.objectStore.getJson<SynthesisOutput>(
-          checkpoint.artifacts.synthesisKey!
-        );
-        if (!citationMap || !synthesis)
-          throw new Error("Missing synthesis/citation-map for finalize");
+        try {
+          const sources = await loadLabeledSources({
+            runId: run.id,
+            checkpoint,
+            store: input.services.store,
+            objectStore: input.services.objectStore,
+          }).catch(() => []);
 
-        const outputMd = renderResearchMemoMarkdown({ synthesis, citationMap });
-        const outputKey = checkpoint.artifacts.outputKey ?? runOutputKey(run.id);
-        await input.services.objectStore.putText(outputKey, outputMd);
-        checkpoint.artifacts.outputKey = outputKey;
+          const synthesisKeyCandidates: string[] = [];
+          const pushKey = (key: unknown) => {
+            if (typeof key === "string" && key.trim()) synthesisKeyCandidates.push(key.trim());
+          };
+          pushKey(checkpoint.artifacts.synthesisKey);
+          pushKey(checkpoint.synthesisState?.snapshotKey);
+          pushKey(runSynthesisKey(run.id));
+          pushKey(checkpoint.researchLoop?.lastSynthesisKey);
+          const lastIterationSynthesisKey = checkpoint.researchLoop?.iterations
+            ?.slice()
+            .sort((a, b) => a.iteration - b.iteration)
+            .at(-1)?.artifacts.synthesisKey;
+          pushKey(lastIterationSynthesisKey);
 
-        await input.services.store.updateRun({
-          runId: run.id,
-          status: "completed",
-          phase: "finalize",
-          state: checkpoint,
-          finishedAt: new Date(),
-        });
+          const dedupedSynthesisKeys = Array.from(new Set(synthesisKeyCandidates));
+          let synthesis: SynthesisOutput | null = null;
+          let synthesisKeyUsed: string | null = null;
+          for (const key of dedupedSynthesisKeys) {
+            const raw = await input.services.objectStore.getJson<unknown>(key);
+            if (!raw) continue;
+            const parsed = SynthesisOutputSchema.safeParse(raw);
+            if (!parsed.success) continue;
+            synthesis = parsed.data;
+            synthesisKeyUsed = key;
+            break;
+          }
+
+          if (!synthesis) {
+            synthesis = SynthesisOutputSchema.parse({
+              summary: "Best-effort synthesis from available artifacts.",
+              keyFindings: [{ id: "F1", text: "Insufficient synthesis state; review sources directly.", citations: [] }],
+              unknowns: [],
+            });
+          } else if (synthesisKeyUsed) {
+            checkpoint.artifacts.synthesisKey = synthesisKeyUsed;
+          }
+
+          const isCitationMapLike = (value: unknown): value is CitationMap => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const cast = value as Record<string, unknown>;
+            return cast.version === 1 && Array.isArray(cast.claims) && Array.isArray(cast.sources);
+          };
+
+          const citationMapKeyCandidates: string[] = [];
+          const pushCitationKey = (key: unknown) => {
+            if (typeof key === "string" && key.trim()) citationMapKeyCandidates.push(key.trim());
+          };
+          pushCitationKey(checkpoint.artifacts.citationMapKey);
+          pushCitationKey(runCitationMapKey(run.id));
+          const lastIterationCitationMapKey = checkpoint.researchLoop?.iterations
+            ?.slice()
+            .sort((a, b) => a.iteration - b.iteration)
+            .at(-1)?.artifacts.citationMapKey;
+          pushCitationKey(lastIterationCitationMapKey);
+          const dedupedCitationMapKeys = Array.from(new Set(citationMapKeyCandidates));
+
+          let citationMap: CitationMap | null = null;
+          let citationMapKeyUsed: string | null = null;
+          for (const key of dedupedCitationMapKeys) {
+            const raw = await input.services.objectStore.getJson<unknown>(key);
+            if (!raw) continue;
+            if (!isCitationMapLike(raw)) continue;
+            citationMap = raw as CitationMap;
+            citationMapKeyUsed = key;
+            break;
+          }
+
+          if (!citationMap) {
+            citationMap = buildCitationMap({
+              runId: run.id,
+              policy: citationPolicy,
+              synthesis,
+              sources,
+            });
+            const key = checkpoint.artifacts.citationMapKey ?? runCitationMapKey(run.id);
+            await input.services.objectStore.putJson(key, citationMap).catch(() => {});
+            checkpoint.artifacts.citationMapKey = key;
+          } else if (citationMapKeyUsed) {
+            checkpoint.artifacts.citationMapKey = citationMapKeyUsed;
+          }
+
+          let outputMd = "";
+          try {
+            outputMd = renderResearchMemoMarkdown({ synthesis, citationMap });
+          } catch (err) {
+            await input.services.store
+              .addRunEvent({
+                runId: run.id,
+                level: "warn",
+                phase: "finalize",
+                eventType: "finalize_render_fallback",
+                message: "renderResearchMemoMarkdown failed; writing minimal best-effort output",
+                data: { error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err) },
+              })
+              .catch(() => {});
+            const sourceLines = sources.map((s) => `- ${s.url}`);
+            outputMd = [
+              "# Research memo",
+              "",
+              "## Summary",
+              "",
+              synthesis.summary,
+              "",
+              "## Key findings",
+              "",
+              ...synthesis.keyFindings.map((f) => `- ${f.text}`),
+              "",
+              "## Sources",
+              "",
+              ...(sourceLines.length ? sourceLines : ["- (none)"]),
+              "",
+            ].join("\n");
+          }
+
+          const outputKey = checkpoint.artifacts.outputKey ?? runOutputKey(run.id);
+          await input.services.objectStore.putText(outputKey, outputMd).catch(async (err) => {
+            await input.services.store
+              .addRunEvent({
+                runId: run.id,
+                level: "error",
+                phase: "finalize",
+                eventType: "finalize_output_write_failed",
+                message: "Failed to write output.md to object store",
+                data: { error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err) },
+              })
+              .catch(() => {});
+          });
+          checkpoint.artifacts.outputKey = outputKey;
+
+          const iterationCompleted = checkpoint.researchLoop?.iterationCountCompleted ?? 0;
+          if (input.services.store.createRunCheckpoint) {
+            const payload = {
+              version: 1,
+              runId: run.id,
+              createdAt: new Date().toISOString(),
+              checkpointVersion: 1,
+              kind: "finalize" as const,
+              iterationCompleted,
+              pipelineCheckpoint: checkpoint,
+              seenUrls: checkpoint.researchLoop?.seenUrls ?? [],
+              seenQueries: checkpoint.researchLoop?.seenQueries ?? [],
+              questionGraph: checkpoint.questionGraph ?? null,
+              synthesisState: checkpoint.synthesisState ?? null,
+              sourceArtifacts: sources.map((s) => ({
+                label: s.label,
+                sourceId: s.sourceId,
+                url: s.url,
+                title: s.title,
+                publisher: s.publisher,
+                fetchedAt: s.fetchedAt,
+                evidenceKey: sourceEvidenceKey(run.id, s.sourceId),
+              })),
+              budgets,
+              deadlineMs: deadline,
+            };
+            await input.services.store
+              .createRunCheckpoint({
+                runId: run.id,
+                kind: "finalize",
+                checkpointVersion: 1,
+                iterationCompleted,
+                payload,
+              })
+              .catch(() => {});
+          }
+
+          await input.services.store.updateRun({
+            runId: run.id,
+            status: "completed",
+            phase: "finalize",
+            state: checkpoint,
+            error: null,
+            finishedAt: new Date(),
+          });
+        } catch (err) {
+          await input.services.store
+            .addRunEvent({
+              runId: run.id,
+              level: "error",
+              phase: "finalize",
+              eventType: "finalize_failed_best_effort",
+              message: "Finalize encountered an unexpected error; marking run completed with best-effort output where possible",
+              data: { error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err) },
+            })
+            .catch(() => {});
+          await input.services.store.updateRun({
+            runId: run.id,
+            status: "completed",
+            phase: "finalize",
+            state: checkpoint,
+            finishedAt: new Date(),
+          });
+        }
         await completePhase("finalize");
       }
     }
@@ -2143,7 +2711,7 @@ async function retrievePhase(input: {
     if (selectedUrls.size >= maxSelectedUrls) break;
     await input.store.addRunEvent({
       runId: input.runId,
-      level: "info",
+      level: "debug",
       phase: "retrieve",
       eventType: "search_query_started",
       message: `Searching web for query: "${q}"`,
@@ -2157,7 +2725,7 @@ async function retrievePhase(input: {
 
     await input.store.addRunEvent({
       runId: input.runId,
-      level: "info",
+      level: "debug",
       phase: "retrieve",
       eventType: "search_query_completed",
       message: `Search query completed: "${q}"`,
@@ -2182,7 +2750,7 @@ async function retrievePhase(input: {
       {
         await input.store.addRunEvent({
           runId: input.runId,
-          level: "info",
+          level: "debug",
           phase: "retrieve",
           eventType: "search_result_candidate",
           message: `Found candidate source: ${url}`,
@@ -2227,7 +2795,7 @@ async function fetchPhase(input: {
 
         await input.store.addRunEvent({
           runId: input.runId,
-          level: "info",
+          level: "debug",
           phase: "fetch",
           eventType: "source_fetch_started",
           message: `Fetching ${s.url}`,
@@ -2259,7 +2827,7 @@ async function fetchPhase(input: {
         await input.objectStore.putBytes(key, res.body);
         await input.store.addRunEvent({
           runId: input.runId,
-          level: "info",
+          level: "debug",
           phase: "fetch",
           eventType: "source_fetch_completed",
           message: `Fetched ${s.url}`,
@@ -2358,7 +2926,7 @@ async function extractPhase(input: {
 
         await input.store.addRunEvent({
           runId: input.runId,
-          level: "info",
+          level: "debug",
           phase: "extract",
           eventType: "source_extract_started",
           message: `Extracting evidence from ${s.url}`,
@@ -2484,7 +3052,7 @@ async function extractPhase(input: {
         await input.objectStore.putJson(evidenceKey, evidence);
         await input.store.addRunEvent({
           runId: input.runId,
-          level: "info",
+          level: "debug",
           phase: "extract",
           eventType: "source_extract_completed",
           message: `Extraction completed: ${s.url}`,
@@ -3113,18 +3681,7 @@ function deriveSynthesisTargets(input: {
 
   const maxRecommendations = Math.min(16, minRecommendations + 4);
 
-  const minSummaryWords =
-    sourceCount <= 1
-      ? 2
-      : sourceCount <= 2
-        ? 4
-        : sourceCount <= 4
-          ? 60
-          : sourceCount <= 8
-            ? 120
-            : sourceCount <= 12
-              ? 200
-              : SYNTHESIS_TARGET_MIN_SUMMARY_WORDS;
+  const minSummaryWords = deriveMinSummaryWords(sourceCount);
 
   return {
     minKeyFindings,
@@ -3135,19 +3692,91 @@ function deriveSynthesisTargets(input: {
   };
 }
 
-function isSynthesisOutputSufficient(input: {
+function deriveMinSummaryWords(sourceCountRaw: number): number {
+  const sourceCount = Math.max(0, sourceCountRaw);
+  if (sourceCount <= 1) return 2;
+  if (sourceCount <= 2) return 4;
+  if (sourceCount <= 4) return 60;
+  if (sourceCount <= 8) return 120;
+  if (sourceCount <= 12) return 200;
+  return SYNTHESIS_TARGET_MIN_SUMMARY_WORDS;
+}
+
+type SynthesisOutputSufficiency = {
+  sufficient: boolean;
+  summaryWordCount: number;
+  findingCount: number;
+  recommendationCount: number;
+  failedChecks: string[];
+  shortfalls: {
+    summaryWords: number;
+    findings: number;
+    recommendations: number;
+  };
+  advanced?: {
+    sourceCount: number;
+    crossSourceFindings: number;
+    minimumCrossSourceFindings: number;
+    requiredCrossSourceFindings: number;
+    requiredSourceCoverage: number;
+    sourceCoverage: number;
+    sourceIndexLength: number;
+    thematicSynthesisLength: number;
+    negativeSpaceCount: number;
+    confidenceAppendixLength: number;
+    checks: {
+      crossSourceSynthesis: boolean;
+      crossSourceDiversity: boolean;
+      broadSourceCoverage: boolean;
+      analyticScaffolding: boolean;
+      synthesisPressure: boolean;
+    };
+    analyticScaffoldingMissing: string[];
+  };
+};
+
+function evaluateSynthesisOutputSufficiency(input: {
   output: SynthesisOutput;
   targets: SynthesisPromptTargets;
   sourceCount: number;
-}): boolean {
+}): SynthesisOutputSufficiency {
   const recommendations = input.output.recommendations ?? [];
   const summaryWordCount = input.output.summary.split(/\s+/).filter(Boolean).length;
-  const baseSufficient =
-    input.output.keyFindings.length >= input.targets.minKeyFindings &&
-    recommendations.length >= input.targets.minRecommendations &&
-    summaryWordCount >= input.targets.minSummaryWords;
-  if (!baseSufficient) return false;
-  if (input.sourceCount <= 2) return true;
+  const findingCount = input.output.keyFindings.length;
+  const recommendationCount = recommendations.length;
+
+  const shortfalls = {
+    summaryWords: Math.max(0, input.targets.minSummaryWords - summaryWordCount),
+    findings: Math.max(0, input.targets.minKeyFindings - findingCount),
+    recommendations: Math.max(0, input.targets.minRecommendations - recommendationCount),
+  };
+  const failedChecks: string[] = [];
+  if (shortfalls.findings > 0) failedChecks.push("min_key_findings");
+  if (shortfalls.recommendations > 0) failedChecks.push("min_recommendations");
+  if (shortfalls.summaryWords > 0) failedChecks.push("min_summary_words");
+
+  const baseSufficient = failedChecks.length === 0;
+  if (!baseSufficient) {
+    return {
+      sufficient: false,
+      summaryWordCount,
+      findingCount,
+      recommendationCount,
+      failedChecks,
+      shortfalls,
+    };
+  }
+
+  if (input.sourceCount <= 2) {
+    return {
+      sufficient: true,
+      summaryWordCount,
+      findingCount,
+      recommendationCount,
+      failedChecks,
+      shortfalls,
+    };
+  }
 
   const findingSourceCounts = input.output.keyFindings.map(
     (f) => new Set((f.citations ?? []).map((c) => c.source).filter(Boolean)).size
@@ -3189,19 +3818,63 @@ function isSynthesisOutputSufficient(input: {
   const synthesisPressure = crossSourceFindings >= 1;
   const hasCrossSourceDiversity = crossSourceFindings >= requiredCrossSourceFindings;
   const hasBroadSourceCoverage = sourceCoverage >= requiredSourceCoverage;
+  if (!hasCrossSourceSynthesis) failedChecks.push("cross_source_synthesis");
+  if (!hasCrossSourceDiversity) failedChecks.push("cross_source_diversity");
+  if (!hasBroadSourceCoverage) failedChecks.push("broad_source_coverage");
   const hasAnalyticScaffolding =
     input.sourceCount < 4 ||
     (sourceIndexLength >= SYNTHESIS_MIN_SOURCE_INDEX_ENTRIES &&
       thematicSynthesisLength >= 1 &&
       negativeSpace >= 1 &&
       confidenceAppendixLength >= 1);
-  return (
+
+  const analyticScaffoldingMissing: string[] = [];
+  if (input.sourceCount >= 4) {
+    if (sourceIndexLength < SYNTHESIS_MIN_SOURCE_INDEX_ENTRIES) analyticScaffoldingMissing.push("sourceIndex");
+    if (thematicSynthesisLength < 1) analyticScaffoldingMissing.push("thematicSynthesis");
+    if (negativeSpace < 1) analyticScaffoldingMissing.push("negativeSpace");
+    if (confidenceAppendixLength < 1) analyticScaffoldingMissing.push("confidenceAppendix");
+  }
+
+  const hasSynthesisPressure = input.sourceCount < 4 || synthesisPressure;
+  if (!hasAnalyticScaffolding) failedChecks.push("analytic_scaffolding");
+  if (!hasSynthesisPressure) failedChecks.push("synthesis_pressure");
+
+  const sufficient =
     hasCrossSourceSynthesis &&
     hasCrossSourceDiversity &&
     hasBroadSourceCoverage &&
     hasAnalyticScaffolding &&
-    (input.sourceCount < 4 || synthesisPressure)
-  );
+    hasSynthesisPressure;
+
+  return {
+    sufficient,
+    summaryWordCount,
+    findingCount,
+    recommendationCount,
+    failedChecks,
+    shortfalls,
+    advanced: {
+      sourceCount: input.sourceCount,
+      crossSourceFindings,
+      minimumCrossSourceFindings,
+      requiredCrossSourceFindings,
+      requiredSourceCoverage,
+      sourceCoverage,
+      sourceIndexLength,
+      thematicSynthesisLength,
+      negativeSpaceCount: negativeSpace,
+      confidenceAppendixLength,
+      checks: {
+        crossSourceSynthesis: hasCrossSourceSynthesis,
+        crossSourceDiversity: hasCrossSourceDiversity,
+        broadSourceCoverage: hasBroadSourceCoverage,
+        analyticScaffolding: hasAnalyticScaffolding,
+        synthesisPressure: hasSynthesisPressure,
+      },
+      analyticScaffoldingMissing,
+    },
+  };
 }
 
 function cloneSourceBriefs(sourceBriefs: SynthesisSourceBrief[]): SynthesisSourceBrief[] {
@@ -3756,6 +4429,10 @@ async function synthesizePhase(input: {
     sourceCount: preTrim.sourceCountAfter,
     quoteCount: preTrim.quoteCountAfter,
   });
+  // Keep the summary depth target based on the total available evidence, even if we cap sources
+  // passed to the model for cost/latency reasons.
+  const summarySourceCount = Math.max(0, preTrim.sourceCountBefore - preTrim.droppedSourceCount);
+  targets.minSummaryWords = deriveMinSummaryWords(summarySourceCount);
   const sourceLabelsForPrompt = input.sources.length;
   const sourceCountCap = preTrim.sourceCountAfter;
   const quoteCountCap = preTrim.quoteCountAfter;
@@ -4056,11 +4733,12 @@ async function synthesizePhase(input: {
       return false;
     };
 
-    const isSufficient = isSynthesisOutputSufficient({
+    const sufficiency = evaluateSynthesisOutputSufficiency({
       output: out,
       targets,
       sourceCount: trimResult.sourceCountAfter,
     });
+    const isSufficient = sufficiency.sufficient;
     const reviewerAccepted = await reviewIfNeeded();
     if (isSufficient && reviewerAccepted) {
       if (attempt > 0) {
@@ -4088,25 +4766,42 @@ async function synthesizePhase(input: {
 
     previousSynthesis = out;
     if (attempt < attempts - 1) {
+      const depthShortfalls = [
+        sufficiency.shortfalls.findings > 0 ? `findings+${sufficiency.shortfalls.findings}` : null,
+        sufficiency.shortfalls.recommendations > 0
+          ? `recs+${sufficiency.shortfalls.recommendations}`
+          : null,
+        sufficiency.shortfalls.summaryWords > 0 ? `summaryWords+${sufficiency.shortfalls.summaryWords}` : null,
+      ].filter(Boolean) as string[];
+      const failureSummary = depthShortfalls.length
+        ? depthShortfalls.join(" ")
+        : sufficiency.failedChecks.length
+          ? `failed=${sufficiency.failedChecks.join(",")}`
+          : "insufficient_depth";
+      const refinementReason = isSufficient ? "review_pending" : "insufficient_depth";
       await input.store
         .addRunEvent({
           runId: input.runId,
           level: "info",
           phase: "synthesize",
           eventType: "synthesis_refinement_requested",
-          message: "Synthesis output did not meet target depth, requesting one more pass",
+          message:
+            refinementReason === "review_pending"
+              ? `Synthesis reviewer requested revisions; requesting one more pass`
+              : `Synthesis output did not meet target depth (${failureSummary}); requesting one more pass`,
           data: {
             attempt: attempt + 1,
             attemptsAllowed: attempts,
-            reason: isSufficient
-              ? "review_pending"
-              : "insufficient_depth",
-            gotSummaryWordCount: out.summary.split(/\\s+/).filter(Boolean).length,
-            gotFindingCount: out.keyFindings.length,
-            gotRecommendationCount: (out.recommendations ?? []).length,
+            reason: refinementReason,
+            gotSummaryWordCount: sufficiency.summaryWordCount,
+            gotFindingCount: sufficiency.findingCount,
+            gotRecommendationCount: sufficiency.recommendationCount,
             targetSummaryWords: targets.minSummaryWords,
             targetFindings: targets.minKeyFindings,
             targetRecommendations: targets.minRecommendations,
+            shortfalls: sufficiency.shortfalls,
+            failedChecks: sufficiency.failedChecks,
+            advanced: sufficiency.advanced ?? null,
             reviewDirectives: reviewDirectives.length,
           },
         })

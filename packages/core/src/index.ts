@@ -11,3 +11,5 @@ export * from "./verify.js";
 export * from "./orchestrator.js";
 export * from "./research-loop.js";
 export * from "./model-router.js";
+export * from "./goal-directed.js";
+export * from "./resume.js";

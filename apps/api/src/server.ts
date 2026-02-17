@@ -1,5 +1,5 @@
 import type { OpenResearchConfig, UsageSnapshot, UserPolicy } from "@openresearch/core";
-import { selectQualityForUser, UserPolicySchema } from "@openresearch/core";
+import { restoreRunStateFromLatestCheckpoint, selectQualityForUser, UserPolicySchema } from "@openresearch/core";
 import type {
   FilesystemObjectStore,
   ObjectStoreListItem,
@@ -215,6 +215,88 @@ export async function buildApiServer(input: {
 
     reply.header("content-type", "text/markdown; charset=utf-8");
     return reply.send(md);
+  });
+
+  app.post("/runs/:runId/resume", async (req, reply) => {
+    const auth = req.auth!;
+    const runId = RunIdParamsSchema.parse(req.params).runId;
+    const run = await input.store.getRun(runId);
+    if (!run) return reply.code(404).send({ error: "not_found" });
+    if (!isAdmin(req) && run.user_id !== auth.user.id)
+      return reply.code(403).send({ error: "forbidden" });
+
+    const existingJob = await input.store.getJobByRunId(runId);
+    const jobActive =
+      existingJob &&
+      (existingJob.status === "queued" ||
+        existingJob.status === "leased" ||
+        existingJob.status === "running");
+
+    if (run.status === "queued" || run.status === "running" || jobActive) {
+      return reply.send({
+        ok: true,
+        runId,
+        status: run.status,
+        phase: run.phase,
+        jobId: existingJob?.id ?? null,
+      });
+    }
+
+    if (run.status === "completed") {
+      return reply.send({
+        ok: true,
+        runId,
+        status: run.status,
+        phase: run.phase,
+        jobId: existingJob?.id ?? null,
+      });
+    }
+
+    if (run.status === "canceled") {
+      return reply.code(409).send({ error: "canceled" });
+    }
+
+    const restore = await restoreRunStateFromLatestCheckpoint({ runId, store: input.store });
+
+    await input.store.updateRun({
+      runId,
+      status: "queued",
+      error: null,
+      finishedAt: null,
+    });
+
+    const job = await input.store.createJob({ runId, userId: run.user_id, priority: 0 });
+    await input.store.addRunEvent({
+      runId,
+      level: "info",
+      eventType: "resume_enqueued",
+      message: "Resume job enqueued",
+      data: {
+        jobId: job.id,
+        ...(restore.restored
+          ? {
+              restored: true,
+              checkpointId: restore.checkpointId,
+              checkpointKind: restore.kind,
+              iterationCompleted: restore.iterationCompleted,
+            }
+          : { restored: false }),
+      },
+    });
+
+    return reply.code(201).send({
+      ok: true,
+      runId,
+      jobId: job.id,
+      ...(restore.restored
+        ? {
+            restored: true,
+            checkpointId: restore.checkpointId,
+            checkpointKind: restore.kind,
+            iterationCompleted: restore.iterationCompleted,
+          }
+        : { restored: false }),
+    });
   });
 
   app.get("/runs/:runId/artifacts", async (req, reply) => {

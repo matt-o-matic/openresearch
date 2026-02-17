@@ -8,6 +8,14 @@ import type { LabeledSource, SynthesisOutput } from "./memo.js";
 import { buildCitationMap } from "./memo.js";
 import { validateCitations, type VerificationReport } from "./verify.js";
 import {
+  QuestionEvidenceSchema,
+  QuestionGraphSchema,
+  computeUnblockedQuestions,
+  normalizeQuestionAnsweredRubric,
+  validateQuestionGraph,
+} from "./goal-directed.js";
+import type { QuestionGraph, QuestionStatus } from "./goal-directed.js";
+import {
   iterationCitationMapKey,
   iterationGapAnalysisKey,
   iterationPlanKey,
@@ -27,6 +35,7 @@ import { normalizeUrl } from "./url.js";
 
 export type ResearchLoopStopReason =
   | "gap_analysis_stop"
+  | "questions_answered"
   | "diminishing_returns"
   | "no_new_sources"
   | "budget_exhausted"
@@ -74,6 +83,7 @@ export type ResearchLoopCheckpointState = {
   seenUrls: string[];
   seenQueries: string[];
   seenTasks: string[];
+  unansweredStreaks: Record<string, number>;
   pending: { queries: string[]; tasks: string[] };
   lastSynthesisKey?: string;
   planVersionKeys: string[];
@@ -87,6 +97,16 @@ const InitialPlanSchema = z.object({
 });
 
 const GapAnalysisModelSchema = z.object({
+  questionUpdates: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        status: z.enum(["unanswered", "partial", "answered", "unanswerable"]),
+        evidence: z.array(QuestionEvidenceSchema).default([]),
+        confidence: z.number().min(0).max(1).optional(),
+      })
+    )
+    .default([]),
   nextQueries: z.array(z.string().min(1)).default([]),
   nextTasks: z.array(z.string().min(1)).default([]),
   stop: z.boolean().default(false),
@@ -267,23 +287,24 @@ function defaultLoopCheckpoint(input: {
 }): ResearchLoopCheckpointState {
   const modeSetting = input.config.mode;
   const mode: ResearchLoopOperationalMode = modeSetting === "hybrid" ? "hybrid" : "incremental";
-  return {
-    version: 1,
-    enabled: input.enabled,
-    modeSetting,
-    mode,
-    maxIterations: Math.max(1, Math.floor(input.config.maxIterations)),
-    switchToHybridAfterRejects: Math.max(1, Math.floor(input.config.switchToHybridAfterRejects)),
-    rejectCount: 0,
-    iterationCountCompleted: 0,
-    seenUrls: [],
-    seenQueries: [],
-    seenTasks: [],
-    pending: { queries: dedupeStrings(input.initialQueries), tasks: [] },
-    planVersionKeys: [],
-    lowValueIterationStreak: 0,
-    iterations: [],
-    ...(input.config.sourcesPerIteration !== undefined
+	  return {
+	    version: 1,
+	    enabled: input.enabled,
+	    modeSetting,
+	    mode,
+	    maxIterations: Math.max(1, Math.floor(input.config.maxIterations)),
+	    switchToHybridAfterRejects: Math.max(1, Math.floor(input.config.switchToHybridAfterRejects)),
+	    rejectCount: 0,
+	    iterationCountCompleted: 0,
+	    seenUrls: [],
+	    seenQueries: [],
+	    seenTasks: [],
+	    unansweredStreaks: {},
+	    pending: { queries: dedupeStrings(input.initialQueries), tasks: [] },
+	    planVersionKeys: [],
+	    lowValueIterationStreak: 0,
+	    iterations: [],
+	    ...(input.config.sourcesPerIteration !== undefined
       ? { sourcesPerIteration: input.config.sourcesPerIteration }
       : {}),
   };
@@ -315,10 +336,10 @@ function coerceLoopCheckpointState(
     ? o.modeSetting
     : fallback.modeSetting;
   const mode = o.mode === "hybrid" ? "hybrid" : "incremental";
-  const sourcesPerIteration =
-    typeof o.sourcesPerIteration === "number" && Number.isFinite(o.sourcesPerIteration) && o.sourcesPerIteration > 0
-      ? Math.floor(o.sourcesPerIteration)
-      : fallback.sourcesPerIteration;
+	  const sourcesPerIteration =
+	    typeof o.sourcesPerIteration === "number" && Number.isFinite(o.sourcesPerIteration) && o.sourcesPerIteration > 0
+	      ? Math.floor(o.sourcesPerIteration)
+	      : fallback.sourcesPerIteration;
   const lowValueIterationStreak =
     typeof o.lowValueIterationStreak === "number" &&
     Number.isFinite(o.lowValueIterationStreak) &&
@@ -332,28 +353,45 @@ function coerceLoopCheckpointState(
       ? Math.floor(o.iterationCountCompleted)
       : fallback.iterationCountCompleted;
 
-  const stopReason = o.stopReason;
-  const enabled = typeof o.enabled === "boolean" ? o.enabled : fallback.enabled;
+	  const stopReason = o.stopReason;
+	  const enabled = typeof o.enabled === "boolean" ? o.enabled : fallback.enabled;
+	  const unansweredStreaks =
+	    o.unansweredStreaks && typeof o.unansweredStreaks === "object" && !Array.isArray(o.unansweredStreaks)
+	      ? Object.fromEntries(
+	          Object.entries(o.unansweredStreaks as Record<string, unknown>)
+	            .filter(([id, streak]) => {
+	              const key = typeof id === "string" ? id.trim() : "";
+	              return (
+	                key.length > 0 &&
+	                typeof streak === "number" &&
+	                Number.isFinite(streak) &&
+	                streak >= 0
+	              );
+	            })
+	            .map(([id, streak]) => [id, Math.floor(streak as number)])
+	        )
+	      : fallback.unansweredStreaks;
 
-  return {
-    ...fallback,
-    version,
-    enabled,
-    modeSetting,
-    mode,
-    maxIterations,
-    switchToHybridAfterRejects,
-    rejectCount,
-    iterationCountCompleted,
-    ...(stopReason ? { stopReason } : {}),
-    seenUrls: Array.isArray(o.seenUrls) ? dedupeStrings(o.seenUrls) : fallback.seenUrls,
-    seenQueries: Array.isArray(o.seenQueries) ? dedupeStrings(o.seenQueries) : fallback.seenQueries,
-    seenTasks: Array.isArray(o.seenTasks) ? dedupeStrings(o.seenTasks) : fallback.seenTasks,
-    pending: o.pending && typeof o.pending === "object"
-      ? {
-          queries: Array.isArray((o.pending as { queries?: unknown }).queries)
-            ? dedupeStrings((o.pending as { queries: string[] }).queries)
-            : fallback.pending.queries,
+	  return {
+	    ...fallback,
+	    version,
+	    enabled,
+	    modeSetting,
+	    mode,
+	    maxIterations,
+	    switchToHybridAfterRejects,
+	    rejectCount,
+	    iterationCountCompleted,
+	    ...(stopReason ? { stopReason } : {}),
+	    seenUrls: Array.isArray(o.seenUrls) ? dedupeStrings(o.seenUrls) : fallback.seenUrls,
+	    seenQueries: Array.isArray(o.seenQueries) ? dedupeStrings(o.seenQueries) : fallback.seenQueries,
+	    seenTasks: Array.isArray(o.seenTasks) ? dedupeStrings(o.seenTasks) : fallback.seenTasks,
+	    unansweredStreaks,
+	    pending: o.pending && typeof o.pending === "object"
+	      ? {
+	          queries: Array.isArray((o.pending as { queries?: unknown }).queries)
+	            ? dedupeStrings((o.pending as { queries: string[] }).queries)
+	            : fallback.pending.queries,
           tasks: Array.isArray((o.pending as { tasks?: unknown }).tasks)
             ? dedupeStrings((o.pending as { tasks: string[] }).tasks)
             : fallback.pending.tasks,
@@ -423,6 +461,45 @@ function shouldStopForDiminishingReturns(input: {
   return input.lowValueIterationStreak >= 2 && input.nextStepsEmpty;
 }
 
+const LAND_THE_PLANE_FINALIZE_RESERVE_MS = 30_000;
+
+function remainingTimeMs(deadlineMs: number): number {
+  return Math.max(0, deadlineMs - Date.now());
+}
+
+function applyQuestionUpdates(input: {
+  graph: QuestionGraph;
+  updates: Array<{
+    id: string;
+    status: QuestionStatus;
+    evidence: Array<z.infer<typeof QuestionEvidenceSchema>>;
+    confidence?: number;
+  }>;
+  iteration: number;
+}): QuestionGraph {
+  const updateById = new Map(input.updates.map((u) => [u.id, u]));
+  const questions = input.graph.questions.map((q) => {
+    const update = updateById.get(q.id);
+    if (!update) return q;
+    return normalizeQuestionAnsweredRubric({
+      ...q,
+      status: update.status,
+      evidence: update.evidence ?? [],
+      ...(update.confidence !== undefined ? { confidence: update.confidence } : {}),
+      updatedAtIteration: input.iteration,
+    });
+  });
+  return validateQuestionGraph({ ...input.graph, questions });
+}
+
+function stopForQuestions(graph: QuestionGraph): boolean {
+  const unblocked = computeUnblockedQuestions(graph);
+  const isResolved = (status: QuestionStatus) => status === "answered" || status === "unanswerable";
+  const unblockedOpen = unblocked.some((q) => !isResolved(q.status));
+  if (unblockedOpen) return false;
+  return graph.questions.every((q) => isResolved(q.status));
+}
+
 export async function runResearchLoop(input: {
   runId: string;
   userId: string;
@@ -477,6 +554,25 @@ export async function runResearchLoop(input: {
     return { stopReason: "gap_analysis_stop", mode: "incremental" };
   }
 
+  const checkpointQuestionGraph = (input.checkpoint as { questionGraph?: unknown }).questionGraph;
+  let questionGraph: QuestionGraph = validateQuestionGraph(
+    QuestionGraphSchema.safeParse(checkpointQuestionGraph).success
+      ? QuestionGraphSchema.parse(checkpointQuestionGraph)
+      : QuestionGraphSchema.parse({
+          validated: true,
+          questions: [
+            {
+              id: "q1",
+              text: input.prompt,
+              dependsOn: [],
+              status: "unanswered",
+              evidence: [],
+            },
+          ],
+        })
+  );
+  (input.checkpoint as { questionGraph?: QuestionGraph }).questionGraph = questionGraph;
+
   let existing = normalizeSources(await input.services.store.listSources(input.runId));
   const seenUrls = new Set<string>([
     ...loopState.seenUrls.map((url) => normalizeUrl(url)),
@@ -524,6 +620,68 @@ export async function runResearchLoop(input: {
     await input.services.store.updateRun({ runId: input.runId, state: input.checkpoint });
   };
 
+  const persistImmutableCheckpoint = async (opts: {
+    kind: "iteration" | "finalize";
+    iterationCompleted: number;
+    sources?: LabeledSource[];
+  }): Promise<void> => {
+    if (!input.services.store.createRunCheckpoint) return;
+    const synthesisState = (input.checkpoint as { synthesisState?: unknown }).synthesisState;
+    const payload = {
+      version: 1,
+      runId: input.runId,
+      createdAt: new Date().toISOString(),
+      checkpointVersion: 1,
+      kind: opts.kind,
+      iterationCompleted: opts.iterationCompleted,
+      pipelineCheckpoint: input.checkpoint,
+      seenUrls: loopState.seenUrls,
+      seenQueries: loopState.seenQueries,
+      questionGraph,
+      synthesisState,
+      sourceArtifacts: (opts.sources ?? []).map((s) => ({
+        label: s.label,
+        sourceId: s.sourceId,
+        url: s.url,
+        title: s.title,
+        publisher: s.publisher,
+        fetchedAt: s.fetchedAt,
+        evidenceKey: sourceEvidenceKey(input.runId, s.sourceId),
+      })),
+      mode: {
+        modeSetting: loopState.modeSetting,
+        mode: loopState.mode,
+      },
+      budgets: input.budgets,
+      deadlineMs: input.deadlineMs,
+    };
+
+    try {
+      await input.services.store.createRunCheckpoint({
+        runId: input.runId,
+        kind: opts.kind,
+        checkpointVersion: 1,
+        iterationCompleted: opts.iterationCompleted,
+        payload,
+      });
+    } catch (err) {
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "warn",
+          phase: "retrieve",
+          eventType: "checkpoint_persist_failed",
+          message: "Failed to persist immutable run checkpoint; continuing without it",
+          data: {
+            kind: opts.kind,
+            iterationCompleted: opts.iterationCompleted,
+            error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          },
+        })
+        .catch(() => {});
+    }
+  };
+
   const persistIterationPlanVersion = async (iterationEntry: ResearchLoopIterationState, gap: GapAnalysisOutput, report: VerificationReport, review: IterationReviewOutput): Promise<void> => {
     const payload = {
       version: 1,
@@ -537,6 +695,7 @@ export async function runResearchLoop(input: {
         tasks: iterationEntry.tasks,
       },
       outputs: {
+        questionUpdates: gap.questionUpdates ?? [],
         nextQueries: gap.nextQueries,
         nextTasks: gap.nextTasks,
         stop: gap.stop,
@@ -577,8 +736,8 @@ export async function runResearchLoop(input: {
     })
     .catch(() => {});
 
-  while (loopState.iterationCountCompleted < loopState.maxIterations) {
-    if (Date.now() > input.deadlineMs) {
+  while (!loopState.stopReason && loopState.iterationCountCompleted < loopState.maxIterations) {
+    if (remainingTimeMs(input.deadlineMs) <= LAND_THE_PLANE_FINALIZE_RESERVE_MS) {
       loopState.stopReason = "budget_exhausted";
       break;
     }
@@ -682,6 +841,11 @@ export async function runResearchLoop(input: {
       iterationEntry.stopReason = "no_new_sources";
       iterationEntry.completedAt = new Date().toISOString();
       loopState.iterationCountCompleted = iterationEntry.iteration;
+      await persistCheckpoint();
+      await persistImmutableCheckpoint({
+        kind: "iteration",
+        iterationCompleted: loopState.iterationCountCompleted,
+      });
       await input.services.store
         .addRunEvent({
           runId: input.runId,
@@ -753,11 +917,24 @@ export async function runResearchLoop(input: {
         ? await input.services.objectStore.getJson<SynthesisOutput>(loopState.lastSynthesisKey)
         : null;
 
+    const fullContextRequested = (input.loopConfig as { fullContext?: boolean }).fullContext === true;
+    const contextBudgetTokens = Math.max(
+      0,
+      input.synthesis.contextWindowTokens - Math.min(10_000, input.synthesis.maxOutputTokens) - 2_048
+    );
+    const fullContextActive = fullContextRequested && contextBudgetTokens >= 50_000;
+
+    const synthesisSources = fullContextActive
+      ? allLabeledSources
+      : promptSources.length
+        ? promptSources
+        : allLabeledSources;
+
     const interimSynthesis = await input.steps.synthesize({
       runId: input.runId,
       userId: input.userId,
       prompt: input.prompt,
-      sources: promptSources.length ? promptSources : allLabeledSources,
+      sources: synthesisSources,
       citationPolicy: input.citationPolicy,
       provider: input.services.modelProvider,
       model: input.models.synthesizer,
@@ -771,12 +948,36 @@ export async function runResearchLoop(input: {
       objectStore: input.services.objectStore,
       checkpoint: input.checkpoint,
       reviewPolicy: "skip",
-      ...(iterationEntry.mode === "incremental" && previousSynthesis ? { previousSynthesis } : {}),
+      ...(!fullContextActive && previousSynthesis ? { previousSynthesis } : {}),
     });
 
     await input.services.objectStore.putJson(iterationEntry.artifacts.synthesisKey, interimSynthesis);
-    if (iterationEntry.mode === "incremental") {
-      loopState.lastSynthesisKey = iterationEntry.artifacts.synthesisKey;
+    loopState.lastSynthesisKey = iterationEntry.artifacts.synthesisKey;
+    (input.checkpoint as { synthesisState?: unknown }).synthesisState = {
+      snapshotKey: iterationEntry.artifacts.synthesisKey,
+      summary: interimSynthesis.summary,
+    };
+    await persistCheckpoint();
+
+    if (iterationEntry.iteration === 1 || fullContextRequested) {
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "synthesize",
+          eventType: "synthesis_context_mode",
+          message: `Synthesis context mode: ${fullContextActive ? "full-context" : "summary+delta"} (contextBudgetTokens=${contextBudgetTokens})`,
+          data: {
+            iteration: iterationEntry.iteration,
+            fullContextRequested,
+            fullContextActive,
+            contextBudgetTokens,
+            sourceCount: synthesisSources.length,
+            promptSourceCount: promptSources.length,
+            totalSourceCount: allLabeledSources.length,
+          },
+        })
+        .catch(() => {});
     }
 
     const citationMap = buildCitationMap({
@@ -805,13 +1006,15 @@ export async function runResearchLoop(input: {
     await input.services.objectStore.putJson(iterationEntry.artifacts.verificationJsonKey, report);
     await input.services.objectStore.putText(iterationEntry.artifacts.verificationMarkdownKey, markdown);
 
+    const landThePlaneNow = remainingTimeMs(input.deadlineMs) <= LAND_THE_PLANE_FINALIZE_RESERVE_MS;
+
     let reviewOutput: IterationReviewOutput = {
       verdict: "accept",
       unsupportedConclusions: [],
       missingEvidence: [],
       requestedRevisions: [],
     };
-    if (input.services.modelProvider) {
+    if (!landThePlaneNow && input.services.modelProvider) {
       const review = await input.steps.review({
         runId: input.runId,
         userId: input.userId,
@@ -846,6 +1049,48 @@ export async function runResearchLoop(input: {
         },
       })
       .catch(() => {});
+
+    if (landThePlaneNow) {
+      loopState.stopReason = "budget_exhausted";
+      iterationEntry.stopReason = "budget_exhausted";
+      iterationEntry.completedAt = new Date().toISOString();
+      loopState.iterationCountCompleted = iterationEntry.iteration;
+      await persistCheckpoint();
+      await persistImmutableCheckpoint({
+        kind: "iteration",
+        iterationCompleted: loopState.iterationCountCompleted,
+        sources: allLabeledSources,
+      });
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "warn",
+          phase: "retrieve",
+          eventType: "land_the_plane",
+          message: `Landing the plane after iteration ${iterationEntry.iteration} (timeRemainingMs=${remainingTimeMs(input.deadlineMs)})`,
+          data: {
+            iteration: iterationEntry.iteration,
+            timeRemainingMs: remainingTimeMs(input.deadlineMs),
+          },
+        })
+        .catch(() => {});
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "retrieve",
+          eventType: "research_iteration_completed",
+          message: `Iteration ${iterationEntry.iteration} completed (netNewSources=${iterationEntry.netNewSources}, mode=${iterationEntry.mode}, stopReason=budget_exhausted)`,
+          data: {
+            iteration: iterationEntry.iteration,
+            netNewSources: iterationEntry.netNewSources,
+            mode: iterationEntry.mode,
+            stopReason: "budget_exhausted",
+          },
+        })
+        .catch(() => {});
+      break;
+    }
 
     if (reviewOutput.verdict === "reject") {
       loopState.rejectCount += 1;
@@ -896,66 +1141,77 @@ export async function runResearchLoop(input: {
           rendersRemaining: Math.max(0, input.budgets.maxBrowserRenders - input.checkpoint.counters.renders),
         };
 
-        const history = loopState.iterations
-          .filter((it) => it.iteration <= iterationEntry.iteration)
-          .map((it) => ({
-            iteration: it.iteration,
-            mode: it.mode,
-            netNewSources: it.netNewSources,
-            reviewVerdict: it.reviewVerdict ?? null,
-            queries: it.queries.slice(0, 6),
-            tasks: it.tasks.slice(0, 6),
-            stopReason: it.stopReason ?? null,
-          }));
-
         const sys: ChatMessage = {
           role: "system",
           content:
-            "You are a research gap analyst. Produce JSON only (no markdown). " +
-            "Given the current plan, interim synthesis, deterministic citation validation, and reviewer feedback, " +
-            "propose the next best research steps (queries + tasks) or stop with a concrete stopReason.",
+            "You are a goal-directed research planner. Produce JSON only (no markdown). " +
+            "Update per-question status for unblocked questions and propose targeted next web search queries " +
+            "for the unanswered/partially-answered unblocked questions. " +
+            "Only mark a question `answered` if you can cite at least one provided source label (S1, S2, ...). " +
+            "A question may also be `answered` by concluding that the requested requirement/threshold/guideline is not " +
+            "publicly specified in the relevant guidance/policy; if so, state that explicitly in the evidence notes and " +
+            "cite the most authoritative sources you checked that demonstrate the scope/absence.",
         };
         const user: ChatMessage = {
           role: "user",
           content: JSON.stringify({
-            task: "Gap analysis and next-step selection",
+            task: "Goal-directed question tracking + next-step selection",
             prompt: input.prompt,
-            currentPlan: {
-              initialPlanKey,
-              latestPlanVersionKey: iterationEntry.artifacts.planKey,
-              pendingQueries: loopState.pending.queries,
-              pendingTasks: loopState.pending.tasks,
-            },
-            history,
+            questionGraph,
+            unblockedQuestions: computeUnblockedQuestions(questionGraph).map((q) => ({
+              id: q.id,
+              text: q.text,
+              status: q.status,
+              dependsOn: q.dependsOn,
+            })),
             interimSynthesis: {
               summary: interimSynthesis.summary,
-              keyFindings: interimSynthesis.keyFindings,
+              keyFindings: interimSynthesis.keyFindings.slice(0, 12),
               unknowns: interimSynthesis.unknowns,
               recommendations: interimSynthesis.recommendations ?? [],
               negativeSpace: interimSynthesis.negativeSpace ?? null,
             },
+            sources: allLabeledSources.map((s) => ({
+              source: s.label,
+              url: s.url,
+              title: s.title,
+              publisher: s.publisher,
+            })),
             citationValidation: {
               coverage: report.coverage,
               topIssues: summarizeTopIssues(report, 12),
             },
             reviewer: {
               verdict: reviewOutput.verdict,
-              missingEvidence: reviewOutput.missingEvidence,
-              requestedRevisions: reviewOutput.requestedRevisions,
+              missingEvidence: reviewOutput.missingEvidence.slice(0, 12),
+              requestedRevisions: reviewOutput.requestedRevisions.slice(0, 12),
               confidenceRisk: reviewOutput.confidenceRisk,
+            },
+            seen: {
+              queries: Array.from(seenQueries).slice(-50),
             },
             remaining,
             outputSchema: {
+              questionUpdates: [
+                {
+                  id: "q1",
+                  status: "partial",
+                  evidence: [{ source: "S1", quoteId: "Q1", note: "evidence note" }],
+                  confidence: 0.6,
+                },
+              ],
               nextQueries: ["..."],
               nextTasks: ["..."],
               stop: false,
-              stopReason: "gap_analysis_stop | diminishing_returns | budget_exhausted | no_new_sources | iteration_cap",
+              stopReason:
+                "questions_answered | diminishing_returns | budget_exhausted | no_new_sources | iteration_cap",
               planNotes: ["..."],
             },
             constraints: {
+              onlyUpdateUnblockedQuestions: true,
               maxNextQueries: 8,
               maxNextTasks: 8,
-              dedupeAgainstHistory: true,
+              dedupeAgainstSeenQueries: true,
             },
           }),
         };
@@ -964,6 +1220,7 @@ export async function runResearchLoop(input: {
           runId: input.runId,
           userId: input.userId,
           phase: "gap-analysis",
+          persona: "goal-directed-gap-analysis",
           provider: input.services.modelProvider,
           model: input.models.planner,
           messages: [sys, user],
@@ -972,12 +1229,180 @@ export async function runResearchLoop(input: {
           store: input.services.store,
           objectStore: input.services.objectStore,
           checkpoint: input.checkpoint,
-          promptVersion: "gap-analysis.v1",
+          promptVersion: "gap-analysis.goal-directed.v1",
         });
         const normalized = GapAnalysisOutputSchema.parse(normalizeGapAnalysisOutput(parsed));
         await input.services.objectStore.putJson(gapKey, normalized);
         return normalized;
       })());
+
+    const questionGraphBeforeUpdate = questionGraph;
+    const updateDiagnostics: {
+      applied: Array<{
+        id: string;
+        fromStatus: QuestionStatus;
+        toStatus: QuestionStatus;
+        requestedStatus: QuestionStatus;
+        confidence?: number;
+        evidenceSources: string[];
+        demotedAnswered: boolean;
+      }>;
+      ignored: Array<{ id: string; reason: "unknown_question_id" | "blocked" }>;
+    } = {
+      applied: [],
+      ignored: [],
+    };
+
+    const rawQuestionUpdates = gap.questionUpdates ?? [];
+    if (rawQuestionUpdates.length > 0) {
+      const questionIdSet = new Set(questionGraph.questions.map((q) => q.id));
+      const unblockedIds = new Set(computeUnblockedQuestions(questionGraph).map((q) => q.id));
+
+      for (const u of rawQuestionUpdates) {
+        if (!questionIdSet.has(u.id)) {
+          updateDiagnostics.ignored.push({ id: u.id, reason: "unknown_question_id" });
+          continue;
+        }
+        if (!unblockedIds.has(u.id)) {
+          updateDiagnostics.ignored.push({ id: u.id, reason: "blocked" });
+        }
+      }
+
+      const updatesToApply = rawQuestionUpdates
+        .filter((u) => unblockedIds.has(u.id))
+        .map((u) => ({
+          id: u.id,
+          status: u.status as QuestionStatus,
+          evidence: u.evidence ?? [],
+          ...(u.confidence !== undefined ? { confidence: u.confidence } : {}),
+        }));
+
+      if (updatesToApply.length > 0) {
+        questionGraph = applyQuestionUpdates({
+          graph: questionGraph,
+          updates: updatesToApply,
+          iteration: iterationEntry.iteration,
+        });
+        (input.checkpoint as { questionGraph?: QuestionGraph }).questionGraph = questionGraph;
+        await persistCheckpoint();
+      }
+
+      const beforeById = new Map(questionGraphBeforeUpdate.questions.map((q) => [q.id, q]));
+      const afterById = new Map(questionGraph.questions.map((q) => [q.id, q]));
+
+      for (const u of updatesToApply) {
+        const before = beforeById.get(u.id);
+        const after = afterById.get(u.id);
+        if (!before || !after) continue;
+        const evidenceSources = Array.from(
+          new Set((u.evidence ?? []).map((e) => (typeof e.source === "string" ? e.source.trim() : "")).filter(Boolean))
+        );
+        const demotedAnswered = u.status === "answered" && after.status !== "answered";
+        updateDiagnostics.applied.push({
+          id: u.id,
+          fromStatus: before.status,
+          toStatus: after.status,
+          requestedStatus: u.status,
+          ...(u.confidence !== undefined ? { confidence: u.confidence } : {}),
+          evidenceSources,
+          demotedAnswered,
+        });
+      }
+    }
+
+    // Heuristic: if an unblocked question is repeatedly reported as unanswered with confidence=0 and
+    // no evidence across multiple iterations, treat it as "unanswerable within the retrieved corpus"
+    // so it stops blocking the run forever.
+    const UNANSWERABLE_STREAK_THRESHOLD = 2;
+    const unblockedIdsForStreak = new Set(computeUnblockedQuestions(questionGraph).map((q) => q.id));
+    const unansweredStreaks = loopState.unansweredStreaks;
+    const newlyUnanswerable: Array<{ id: string; streak: number }> = [];
+
+    for (const q of questionGraph.questions) {
+      const isCandidate =
+        unblockedIdsForStreak.has(q.id) &&
+        q.status === "unanswered" &&
+        (q.evidence?.length ?? 0) === 0 &&
+        q.confidence === 0;
+
+      const nextStreak = isCandidate ? (unansweredStreaks[q.id] ?? 0) + 1 : 0;
+      unansweredStreaks[q.id] = nextStreak;
+
+      if (isCandidate && nextStreak >= UNANSWERABLE_STREAK_THRESHOLD) {
+        newlyUnanswerable.push({ id: q.id, streak: nextStreak });
+      }
+    }
+
+    if (newlyUnanswerable.length > 0) {
+      const byId = new Map(newlyUnanswerable.map((u) => [u.id, u]));
+      questionGraph = validateQuestionGraph({
+        ...questionGraph,
+        questions: questionGraph.questions.map((q) => {
+          const match = byId.get(q.id);
+          if (!match) return q;
+          return {
+            ...q,
+            status: "unanswerable",
+            evidence: [
+              {
+                note:
+                  `Marked unanswerable after ${match.streak} iterations with no evidence (confidence=0). ` +
+                  "This indicates the answer was not found in the retrieved public sources for this run.",
+              },
+            ],
+            updatedAtIteration: iterationEntry.iteration,
+          };
+        }),
+      });
+      (input.checkpoint as { questionGraph?: QuestionGraph }).questionGraph = questionGraph;
+
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "plan",
+          eventType: "question_marked_unanswerable",
+          message: `Marked ${newlyUnanswerable.length} question(s) as unanswerable after repeated zero-evidence iterations`,
+          data: {
+            iteration: iterationEntry.iteration,
+            threshold: UNANSWERABLE_STREAK_THRESHOLD,
+            questions: newlyUnanswerable,
+          },
+        })
+        .catch(() => {});
+    }
+
+    const questionCounts = {
+      total: questionGraph.questions.length,
+      answered: questionGraph.questions.filter((q) => q.status === "answered").length,
+      unanswerable: questionGraph.questions.filter((q) => q.status === "unanswerable").length,
+      partial: questionGraph.questions.filter((q) => q.status === "partial").length,
+      unanswered: questionGraph.questions.filter((q) => q.status === "unanswered").length,
+    };
+
+    const unblocked = computeUnblockedQuestions(questionGraph);
+    const unblockedIdsAfter = new Set(unblocked.map((q) => q.id));
+    const blocked = questionGraph.questions.filter((q) => !unblockedIdsAfter.has(q.id));
+    const unblockedCounts = {
+      total: unblocked.length,
+      answered: unblocked.filter((q) => q.status === "answered").length,
+      unanswerable: unblocked.filter((q) => q.status === "unanswerable").length,
+      partial: unblocked.filter((q) => q.status === "partial").length,
+      unanswered: unblocked.filter((q) => q.status === "unanswered").length,
+    };
+    const blockedCounts = {
+      total: blocked.length,
+      answered: blocked.filter((q) => q.status === "answered").length,
+      unanswerable: blocked.filter((q) => q.status === "unanswerable").length,
+      partial: blocked.filter((q) => q.status === "partial").length,
+      unanswered: blocked.filter((q) => q.status === "unanswered").length,
+    };
+    const openUnblocked = unblocked.filter((q) => q.status !== "answered" && q.status !== "unanswerable");
+    const openUnblockedLabels = openUnblocked
+      .slice(0, 6)
+      .map((q) => `${q.id}=${q.status}${q.confidence !== undefined ? `(${q.confidence.toFixed(2)})` : ""}`);
+
+    const questionStop = stopForQuestions(questionGraph);
 
     await input.services.store
       .addRunEvent({
@@ -985,22 +1410,119 @@ export async function runResearchLoop(input: {
         level: "info",
         phase: "plan",
         eventType: "research_iteration_gap_analysis_completed",
-        message: `Iteration ${iterationEntry.iteration} gap analysis: stop=${gap.stop} nextQueries=${gap.nextQueries.length} nextTasks=${gap.nextTasks.length}`,
+        message:
+          `Iteration ${iterationEntry.iteration} goal-directed update: stop=${questionStop} ` +
+          `answered=${questionCounts.answered}/${questionCounts.total} partial=${questionCounts.partial} ` +
+          `unblockedAnswered=${unblockedCounts.answered}/${unblockedCounts.total} ` +
+          `unblockedOpen=${openUnblocked.length}/${unblockedCounts.total} ` +
+          `nextQueries=${gap.nextQueries.length} nextTasks=${gap.nextTasks.length}` +
+          (openUnblockedLabels.length ? `\n  Open unblocked: ${openUnblockedLabels.join(", ")}` : ""),
         data: {
           iteration: iterationEntry.iteration,
-          stop: gap.stop,
-          stopReason: gap.stopReason ?? null,
+          stop: questionStop,
+          stopReason: questionStop ? "questions_answered" : null,
+          questionCounts,
+          unblockedCounts,
+          blockedCounts,
+          openUnblocked: openUnblocked.map((q) => ({
+            id: q.id,
+            status: q.status,
+            dependsOn: q.dependsOn,
+            confidence: q.confidence ?? null,
+          })),
+          blocked: blocked.slice(0, 12).map((q) => ({
+            id: q.id,
+            status: q.status,
+            dependsOn: q.dependsOn,
+          })),
+          questionUpdatesApplied: updateDiagnostics.applied,
+          questionUpdatesIgnored: updateDiagnostics.ignored,
           nextQueries: gap.nextQueries.slice(0, 6),
           nextTasks: gap.nextTasks.slice(0, 6),
+          planNotes: gap.planNotes?.slice(0, 6) ?? [],
         },
       })
       .catch(() => {});
 
-    iterationEntry.gapAnalysisStop = gap.stop;
-    if (gap.stopReason) iterationEntry.gapAnalysisStopReason = gap.stopReason;
+    if (rawQuestionUpdates.length > 0 || openUnblocked.length > 0) {
+      const graphById = new Map(questionGraph.questions.map((q) => [q.id, q]));
+      const blockedLines = blocked
+        .slice(0, 12)
+        .map((q) => {
+          const waitingOn = q.dependsOn
+            .map((dep) => graphById.get(dep))
+            .filter(Boolean)
+            .filter((dep) => dep!.status !== "answered")
+            .map((dep) => dep!.id);
+          return `${q.id}(${q.status}) waitingOn=${waitingOn.length ? waitingOn.join(",") : "n/a"}`;
+        });
+      const updateLines = updateDiagnostics.applied.map(
+        (u) =>
+          `${u.id} ${u.fromStatus}->${u.toStatus}` +
+          (u.demotedAnswered ? " (demoted)" : "") +
+          (u.evidenceSources.length ? ` evidence=${u.evidenceSources.join(",")}` : "") +
+          (u.confidence !== undefined ? ` conf=${u.confidence.toFixed(2)}` : "")
+      );
 
-    const nextQueriesOut = dedupeStrings(gap.nextQueries).filter((q) => !seenQueries.has(q));
-    const nextTasksOut = dedupeStrings(gap.nextTasks).filter((t) => !seenTasks.has(t));
+      const debugMessageLines = [
+        `Goal-directed debug (iteration ${iterationEntry.iteration})`,
+        `  Totals: answered=${questionCounts.answered}/${questionCounts.total} partial=${questionCounts.partial} unanswered=${questionCounts.unanswered}`,
+        `  Unblocked: answered=${unblockedCounts.answered}/${unblockedCounts.total} partial=${unblockedCounts.partial} open=${openUnblocked.length}`,
+        ...(openUnblockedLabels.length ? [`  Open unblocked: ${openUnblockedLabels.join(", ")}`] : []),
+        ...(updateLines.length ? [`  Applied updates: ${updateLines.join(" | ")}`] : []),
+        ...(updateDiagnostics.ignored.length
+          ? [
+              `  Ignored updates: ${updateDiagnostics.ignored
+                .slice(0, 12)
+                .map((u) => `${u.id}(${u.reason})`)
+                .join(" | ")}`,
+            ]
+          : []),
+        ...(blockedLines.length ? [`  Blocked: ${blockedLines.join(" | ")}`] : []),
+        ...(gap.planNotes && gap.planNotes.length
+          ? [`  Plan notes: ${gap.planNotes.slice(0, 6).join(" | ")}`]
+          : []),
+      ];
+
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "debug",
+          phase: "plan",
+          eventType: "research_iteration_goal_directed_debug",
+          message: debugMessageLines.join("\n"),
+          data: {
+            iteration: iterationEntry.iteration,
+            questionCounts,
+            unblockedCounts,
+            blockedCounts,
+            questionGraph: {
+              validated: questionGraph.validated,
+              questions: questionGraph.questions.map((q) => ({
+                id: q.id,
+                status: q.status,
+                dependsOn: q.dependsOn,
+                confidence: q.confidence ?? null,
+              })),
+            },
+            questionUpdatesApplied: updateDiagnostics.applied,
+            questionUpdatesIgnored: updateDiagnostics.ignored,
+            planNotes: gap.planNotes ?? [],
+          },
+        })
+        .catch(() => {});
+    }
+
+    iterationEntry.gapAnalysisStop = questionStop || gap.stop;
+    if (questionStop) iterationEntry.gapAnalysisStopReason = "questions_answered";
+    else if (gap.stopReason) iterationEntry.gapAnalysisStopReason = gap.stopReason;
+
+    const nextQueriesOut = questionStop
+      ? []
+      : dedupeStrings(gap.nextQueries).filter((q) => !seenQueries.has(q));
+    const nextTasksOut = questionStop
+      ? []
+      : dedupeStrings(gap.nextTasks).filter((t) => !seenTasks.has(t));
 
     loopState.pending = {
       queries: nextQueriesOut,
@@ -1015,13 +1537,16 @@ export async function runResearchLoop(input: {
     let shouldStop = false;
     let stopReason: ResearchLoopStopReason | undefined;
 
-    if (gap.stop) {
+    if (questionStop) {
+      shouldStop = true;
+      stopReason = "questions_answered";
+    } else if (gap.stop) {
       shouldStop = true;
       stopReason = mapStopReasonFromGapAnalysis(gap);
     } else if (iterationEntry.iteration >= loopState.maxIterations) {
       shouldStop = true;
       stopReason = "iteration_cap";
-    } else if (Date.now() > input.deadlineMs) {
+    } else if (remainingTimeMs(input.deadlineMs) <= LAND_THE_PLANE_FINALIZE_RESERVE_MS) {
       shouldStop = true;
       stopReason = "budget_exhausted";
     } else if (selectedNewUrls.length === 0) {
@@ -1045,6 +1570,11 @@ export async function runResearchLoop(input: {
     iterationEntry.completedAt = new Date().toISOString();
     loopState.iterationCountCompleted = iterationEntry.iteration;
     await persistCheckpoint();
+    await persistImmutableCheckpoint({
+      kind: "iteration",
+      iterationCompleted: loopState.iterationCountCompleted,
+      sources: allLabeledSources,
+    });
 
     await input.services.store
       .addRunEvent({

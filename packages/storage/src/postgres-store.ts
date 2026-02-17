@@ -95,6 +95,18 @@ export type DbRunEvent = {
   data: unknown;
 };
 
+export type RunCheckpointKind = "iteration" | "finalize";
+export type DbRunCheckpoint = {
+  id: string;
+  run_id: string;
+  kind: RunCheckpointKind;
+  checkpoint_version: number;
+  iteration_completed: number;
+  payload: unknown;
+  payload_hash: string;
+  created_at: string;
+};
+
 export type SourceStatus = "pending" | "fetched" | "rendered" | "extracted" | "failed" | "skipped";
 export type DbSource = {
   id: string;
@@ -155,6 +167,32 @@ function monthStartUtc(date: Date): string {
   return `${date.toISOString().slice(0, 7)}-01`;
 }
 
+const DB_RETRYABLE_ERROR_CODES = new Set([
+  "08000",
+  "08001",
+  "08003",
+  "08006",
+  "57P01",
+  "57P02",
+  "57P03",
+  "53300",
+  "53400",
+]);
+
+function isRetryableDbError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const err = error as { code?: unknown; message?: unknown };
+
+  if (typeof err.code === "string" && DB_RETRYABLE_ERROR_CODES.has(err.code)) return true;
+
+  const message = typeof err.message === "string" ? err.message : "";
+  return /connection (terminated|closed|dropped|reset|lost)|server closed the connection/i.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class PostgresStore {
   readonly databaseUrl: string;
   readonly migrationsDir: string;
@@ -165,6 +203,26 @@ export class PostgresStore {
     this.migrationsDir =
       opts.migrationsDir ?? fileURLToPath(new URL("../migrations", import.meta.url));
     this.pool = createPool(this.databaseUrl);
+  }
+
+  private async withDbRetry<T>(
+    fn: () => Promise<T>,
+    opts: { attempts?: number; baseDelayMs?: number } = {}
+  ): Promise<T> {
+    const attempts = Math.max(1, opts.attempts ?? 4);
+    const baseDelayMs = Math.max(25, opts.baseDelayMs ?? 150);
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        if (attempt >= attempts || !isRetryableDbError(error)) throw error;
+        const delayMs = baseDelayMs * attempt;
+        await sleep(delayMs);
+      }
+    }
+
+    throw new Error("Unreachable");
   }
 
   async close(): Promise<void> {
@@ -396,7 +454,9 @@ export class PostgresStore {
   }
 
   async getRun(runId: string): Promise<DbRun | null> {
-    const res = await this.pool.query<DbRun>("SELECT * FROM runs WHERE id = $1", [runId]);
+    const res = await this.withDbRetry(() =>
+      this.pool.query<DbRun>("SELECT * FROM runs WHERE id = $1", [runId])
+    );
     return res.rows[0] ?? null;
   }
 
@@ -458,17 +518,83 @@ export class PostgresStore {
 
   async listRunEvents(runId: string, opts?: { limit?: number }): Promise<DbRunEvent[]> {
     const limit = opts?.limit ?? 50;
-    const res = await this.pool.query<DbRunEvent>(
-      `SELECT * FROM run_events WHERE run_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    const res = await this.withDbRetry(() =>
+      this.pool.query<DbRunEvent>(
+        `SELECT * FROM run_events WHERE run_id = $1 ORDER BY created_at DESC LIMIT $2`,
+        [runId, limit]
+      )
+    );
+    return res.rows;
+  }
+
+  async createRunCheckpoint(input: {
+    runId: string;
+    kind: RunCheckpointKind;
+    checkpointVersion: number;
+    iterationCompleted: number;
+    payload: unknown;
+  }): Promise<DbRunCheckpoint> {
+    const res = await this.pool.query<DbRunCheckpoint>(
+      `
+        INSERT INTO run_checkpoints (
+          run_id, kind, checkpoint_version, iteration_completed, payload, payload_hash
+        )
+        VALUES ($1, $2, $3, $4, $5, encode(digest(($5::jsonb)::text, 'sha256'), 'hex'))
+        RETURNING *
+      `,
+      [
+        input.runId,
+        input.kind,
+        input.checkpointVersion,
+        Math.max(0, Math.floor(input.iterationCompleted)),
+        input.payload ?? {},
+      ]
+    );
+    return res.rows[0]!;
+  }
+
+  async listRunCheckpoints(runId: string, opts?: { limit?: number }): Promise<DbRunCheckpoint[]> {
+    const limit = Math.max(1, Math.floor(opts?.limit ?? 50));
+    const res = await this.pool.query<DbRunCheckpoint>(
+      `SELECT * FROM run_checkpoints WHERE run_id = $1 ORDER BY created_at DESC LIMIT $2`,
       [runId, limit]
     );
     return res.rows;
   }
 
-  async listModelCalls(runId: string): Promise<DbModelCall[]> {
-    const res = await this.pool.query<DbModelCall>(
-      `SELECT * FROM model_calls WHERE run_id = $1 ORDER BY created_at ASC`,
+  async getLatestValidRunCheckpoint(runId: string): Promise<DbRunCheckpoint | null> {
+    const candidates = await this.pool.query<
+      DbRunCheckpoint & { computed_hash: string }
+    >(
+      `
+        SELECT
+          *,
+          encode(digest(payload::text, 'sha256'), 'hex') AS computed_hash
+        FROM run_checkpoints
+        WHERE run_id = $1
+        ORDER BY created_at DESC
+        LIMIT 25
+      `,
       [runId]
+    );
+
+    for (const row of candidates.rows) {
+      if (row.payload_hash === row.computed_hash) {
+        const { computed_hash: computedHash, ...rest } = row;
+        void computedHash;
+        return rest;
+      }
+    }
+
+    return null;
+  }
+
+  async listModelCalls(runId: string): Promise<DbModelCall[]> {
+    const res = await this.withDbRetry(() =>
+      this.pool.query<DbModelCall>(
+        `SELECT * FROM model_calls WHERE run_id = $1 ORDER BY created_at ASC`,
+        [runId]
+      )
     );
     return res.rows;
   }
@@ -701,9 +827,11 @@ export class PostgresStore {
   }
 
   async listSources(runId: string): Promise<DbSource[]> {
-    const res = await this.pool.query<DbSource>(
-      `SELECT * FROM sources WHERE run_id = $1 ORDER BY created_at ASC`,
-      [runId]
+    const res = await this.withDbRetry(() =>
+      this.pool.query<DbSource>(
+        `SELECT * FROM sources WHERE run_id = $1 ORDER BY created_at ASC`,
+        [runId]
+      )
     );
     return res.rows;
   }

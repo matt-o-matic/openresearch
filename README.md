@@ -152,23 +152,49 @@ curl -sS http://localhost:8787/runs/<runId> -H "Authorization: Bearer $ADMIN_KEY
 curl -sS http://localhost:8787/runs/<runId>/output -H "Authorization: Bearer $ADMIN_KEY"
 ```
 
+Resume a run (owner-only, idempotent):
+
+```bash
+curl -sS -X POST http://localhost:8787/runs/<runId>/resume -H "Authorization: Bearer $ADMIN_KEY" | jq
+```
+
+CLI shortcut (calls the API by default):
+
+```bash
+OPENRESEARCH_API_URL=http://localhost:8787 OPENRESEARCH_API_KEY=$ADMIN_KEY \\
+  ./node_modules/.bin/openresearch resume <runId>
+```
+
 ### CLI (synchronous local run)
 
 ```bash
 ./node_modules/.bin/openresearch run "What is X? Provide citations."
 ```
 
-Local CLI runs are verbose by default. As the run executes you will see phase transitions, lookup/extract activity, and a live `mm:ss` elapsed timer in the console.
+Local CLI runs stream progress by default (`--verbosity 2`): phase transitions, goal-directed progress, and coarse source/counter summaries with a live `mm:ss` elapsed timer.
+
+Verbosity controls how much detail is printed while a run is executing:
+- `--verbosity 0`: print only the final output (and errors).
+- `--verbosity 1`: print the final output plus run stats.
+- `--verbosity 2` (default): show high-level progress events.
+- `--verbosity 3`: include debug-level per-query/per-source retrieval/extraction events.
 
 ## Iterative research loop (enabled by default)
 
 After the initial plan, OpenResearch iterates in small evidence batches:
 retrieve net-new sources → fetch/extract → interim synthesis → deterministic citation validation → reviewer + gap analysis → repeat.
 
+Stop behavior:
+- Stops early when extracted core questions are answered (goal-directed stop criteria).
+- Under time pressure, “lands the plane”: completes the current iteration and finalizes best-effort output without starting another iteration.
+
 Disable the loop (escape hatch):
 - CLI: `openresearch run --no-research-loop "..."`.
 - Config: set `policies.qualityProfiles.*.researchLoop.enabled=false`.
 - API: `POST /runs` with `"researchLoop": false`.
+
+Optional full-context carry-forward (debug/advanced):
+- Set `policies.qualityProfiles.*.researchLoop.fullContext=true` to allow full-context carry-forward when internal `contextBudgetTokens >= 50_000` (otherwise it falls back to summary+delta).
 
 Inspect intermediate iteration artifacts:
 - `openresearch run --debug-loop "..."` prints per-iteration next-steps summaries.

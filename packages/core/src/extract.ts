@@ -1,6 +1,6 @@
 /// <reference lib="dom" />
 
-import { JSDOM } from "jsdom";
+import { JSDOM, VirtualConsole } from "jsdom";
 import { Readability } from "@mozilla/readability";
 
 export type ExtractedMetadata = {
@@ -75,6 +75,15 @@ export function isExtractStackOverflowError(error: unknown): boolean {
     return /maximum call stack size exceeded/i.test(error.message);
   }
 
+  return false;
+}
+
+function isJSDOMCssParseError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const message = (error as { message?: unknown }).message;
+  const type = (error as { type?: unknown }).type;
+  if (typeof type === "string" && type.toLowerCase().includes("css")) return true;
+  if (typeof message === "string" && message.toLowerCase().includes("could not parse css")) return true;
   return false;
 }
 
@@ -240,7 +249,17 @@ function stripTagBlockText(html: string, tagName: string): string {
 }
 
 export function extractFromHtml(html: string, opts?: { url?: string }): ExtractedEvidence {
-  const dom = new JSDOM(html, { url: opts?.url ?? "https://example.invalid" });
+  const virtualConsole = new VirtualConsole();
+  virtualConsole.sendTo(console, { omitJSDOMErrors: true });
+  virtualConsole.on("jsdomError", (error) => {
+    if (isJSDOMCssParseError(error)) return;
+    console.error(error);
+  });
+
+  const dom = new JSDOM(html, {
+    url: opts?.url ?? "https://example.invalid",
+    virtualConsole,
+  });
   const doc = dom.window.document;
 
   // Remove the most common non-content nodes before readability.
