@@ -56,6 +56,52 @@ export function runSynthesisKey(runId: string): string {
   return runArtifactKey(runId, "synthesis.json");
 }
 
+export function runFinalSynthesisReviewKey(runId: string): string {
+  return runArtifactKey(runId, "final/full-synthesis-review.json");
+}
+
+export function iterationPrefix(runId: string, iteration: number): string {
+  const i = Math.max(0, Math.floor(iteration));
+  return `${runPrefix(runId)}/iterations/${i}`;
+}
+
+export function iterationArtifactKey(runId: string, iteration: number, relative: string): string {
+  const i = Math.max(0, Math.floor(iteration));
+  return runArtifactKey(runId, `iterations/${i}/${relative}`);
+}
+
+export function iterationPlanKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "plan.json");
+}
+
+export function iterationRetrievalKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "retrieval.json");
+}
+
+export function iterationSynthesisKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "synthesis.json");
+}
+
+export function iterationCitationMapKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "citation-map.json");
+}
+
+export function iterationVerificationJsonKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "verification-report.json");
+}
+
+export function iterationVerificationMarkdownKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "verification-report.md");
+}
+
+export function iterationReviewKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "review.json");
+}
+
+export function iterationGapAnalysisKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "gap-analysis.json");
+}
+
 export function debugSourceRenderedHtmlKey(runId: string, sourceId: string): string {
   return runArtifactKey(runId, `debug/sources/${sourceId}/rendered.html`);
 }

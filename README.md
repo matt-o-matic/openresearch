@@ -1,6 +1,6 @@
 # OpenResearch (MVP)
 
-OpenResearch is an open-source research harness that runs a multi-phase pipeline (plan → retrieve → fetch → extract → synthesize → verify → finalize), produces grounded outputs with citations, and persists replayable run artifacts (queries, URLs, timestamps, prompts, extracts, outputs).
+OpenResearch is an open-source research harness that runs a multi-phase pipeline (plan → iterative research loop → verify → finalize), produces grounded outputs with citations, and persists replayable run artifacts (queries, URLs, timestamps, prompts, extracts, outputs).
 
 This repo ships:
 
@@ -159,6 +159,20 @@ curl -sS http://localhost:8787/runs/<runId>/output -H "Authorization: Bearer $AD
 ```
 
 Local CLI runs are verbose by default. As the run executes you will see phase transitions, lookup/extract activity, and a live `mm:ss` elapsed timer in the console.
+
+## Iterative research loop (enabled by default)
+
+After the initial plan, OpenResearch iterates in small evidence batches:
+retrieve net-new sources → fetch/extract → interim synthesis → deterministic citation validation → reviewer + gap analysis → repeat.
+
+Disable the loop (escape hatch):
+- CLI: `openresearch run --no-research-loop "..."`.
+- Config: set `policies.qualityProfiles.*.researchLoop.enabled=false`.
+- API: `POST /runs` with `"researchLoop": false`.
+
+Inspect intermediate iteration artifacts:
+- `openresearch run --debug-loop "..."` prints per-iteration next-steps summaries.
+- `openresearch run --advanced "..."` prints per-iteration artifact keys.
 
 ## Repo layout
 

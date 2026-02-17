@@ -9,16 +9,23 @@ import type {
   OpenResearchConfig,
   AgenticLoopConfig,
   SynthesisConfig,
+  ResearchLoopConfig,
   PhaseModelConfig,
   ThinkingMode,
 } from "./config.js";
 import {
   AgenticLoopConfigSchema,
+  ResearchLoopConfigSchema,
   SynthesisConfigSchema,
 } from "./config.js";
 import type { SearchAdapter, HttpFetchAdapter, BrowserRenderAdapter } from "./adapters.js";
 import type { ExtractedEvidence } from "./extract.js";
-import { extractFromHtml, extractFromText } from "./extract.js";
+import {
+  extractFromHtml,
+  extractFromText,
+  extractTextFromHtml,
+  isExtractStackOverflowError,
+} from "./extract.js";
 import type { ChatCompletionResponse, ChatMessage, ModelProvider } from "./models.js";
 import { ModelRouter } from "./model-router.js";
 import {
@@ -39,6 +46,8 @@ import {
 import type { CitationMap, LabeledSource, SynthesisOutput } from "./memo.js";
 import { buildCitationMap, renderResearchMemoMarkdown, SynthesisOutputSchema } from "./memo.js";
 import { validateCitations } from "./verify.js";
+import { runResearchLoop, type ResearchLoopCheckpointState } from "./research-loop.js";
+import { normalizeUrl } from "./url.js";
 
 export type PipelinePhase =
   | "plan"
@@ -62,6 +71,7 @@ export type RunCheckpoint = {
   selectedUrls?: string[];
   sourceIds?: string[];
   sourceLabels?: Record<string, string>; // sourceId -> label
+  researchLoop?: ResearchLoopCheckpointState;
   artifacts: {
     planKey?: string;
     retrievalKey?: string;
@@ -270,45 +280,527 @@ function buildPlanTodoHints(plan: PlanOutput): string[] {
     .slice(0, MAX_PLAN_TODO_QUERY_HINTS);
 }
 
-function extractFirstJson(text: string): unknown {
-  const fenced = text.match(/```json\\s*([\\s\\S]*?)\\s*```/i);
-  const candidate = fenced?.[1] ?? text;
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    const slice = candidate.slice(start, end + 1);
-    return JSON.parse(slice);
-  }
-  return JSON.parse(candidate);
+const MODEL_CALL_EMPTY_RESPONSE_MARKER = "EMPTY_MODEL_RESPONSE";
+type SynthesisCallPurpose = "source-abstracts" | "review" | "writing" | "other";
+type SynthesisCallPersona = "synthesis-source-compression" | "synthesis-review" | "synthesis-writing";
+type JsonSchemaCompatMode =
+  | "legacy-source-abstracts-shim"
+  | "legacy-review-shim"
+  | "legacy-review-unsupported-items-shim";
+type JsonExtractionResult = {
+  value: unknown;
+  schemaCompatMode?: JsonSchemaCompatMode;
+};
+
+function parseAttemptedJson(input: string): unknown {
+  return JSON.parse(input);
 }
 
-function normalizeUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    u.hash = "";
-    const params = new URLSearchParams(u.search);
-    for (const key of Array.from(params.keys())) {
-      if (key.startsWith("utm_")) params.delete(key);
+function extractJsonCandidates(text: string): string[] {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const candidate = (fenced?.[1] ?? text).trim();
+  const candidates = new Set<string>();
+  const trim = candidate.trim();
+  if (!trim) return [];
+  candidates.add(trim);
+
+  const firstBrace = trim.indexOf("{");
+  const firstBracket = trim.indexOf("[");
+  const start =
+    firstBrace === -1
+      ? firstBracket
+      : firstBracket === -1
+        ? firstBrace
+        : Math.min(firstBrace, firstBracket);
+  if (start !== -1) candidates.add(trim.slice(start));
+
+  const lastCurly = trim.lastIndexOf("}");
+  const lastSquare = trim.lastIndexOf("]");
+  if (lastCurly !== -1) candidates.add(trim.slice(0, lastCurly + 1));
+  if (lastSquare !== -1) candidates.add(trim.slice(0, lastSquare + 1));
+
+  return Array.from(candidates);
+}
+
+function extractBalancedJsonPrefix(text: string): string {
+  const start = Math.min(
+    ...[text.indexOf("{"), text.indexOf("["), Number.POSITIVE_INFINITY].filter((v) => v !== -1)
+  );
+  if (!Number.isFinite(start)) return "";
+  const slice = text.slice(start);
+  const stack: Array<"{" | "["> = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < slice.length; i += 1) {
+    const ch = slice[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
     }
-    u.search = params.toString() ? `?${params.toString()}` : "";
-    return u.toString().replace(/\/$/, "");
-  } catch {
-    return url;
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{" || ch === "[") {
+      stack.push(ch);
+      continue;
+    }
+
+    if (ch === "}" || ch === "]") {
+      const top = stack[stack.length - 1];
+      const matches =
+        (ch === "}" && top === "{") || (ch === "]" && top === "[");
+      if (!matches) continue;
+      stack.pop();
+      if (stack.length === 0) return slice.slice(0, i + 1);
+    }
   }
+
+  return "";
+}
+
+function repairTruncatedJson(candidate: string): string {
+  if (!candidate.trim()) return "";
+  const trimmed = candidate.trim();
+  const first = Math.min(
+    ...[trimmed.indexOf("{"), trimmed.indexOf("["), Number.POSITIVE_INFINITY].filter((v) => v !== -1)
+  );
+  if (!Number.isFinite(first)) return "";
+  const slice = trimmed.slice(first);
+  const stack: Array<"{" | "["> = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < slice.length; i += 1) {
+    const ch = slice[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      stack.push(ch);
+      continue;
+    }
+    if (ch === "}" || ch === "]") {
+      const top = stack[stack.length - 1];
+      const matches = (ch === "}" && top === "{") || (ch === "]" && top === "[");
+      if (matches) {
+        stack.pop();
+      }
+    }
+  }
+
+  if (inString || escaped || stack.length === 0) {
+    return "";
+  }
+
+  const trailing = stack
+    .map((ch) => (ch === "{" ? "}" : "]"))
+    .reverse()
+    .join("");
+  return `${slice}${trailing}`;
+}
+
+function coerceString(value: unknown, fallback = ""): string {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  return fallback;
+}
+
+function coerceStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+}
+
+type DataTypeCoercionResult = {
+  dataTypes: string[];
+  converted: boolean;
+};
+
+function coerceSourceAbstractDataTypes(value: unknown): DataTypeCoercionResult {
+  if (Array.isArray(value)) {
+    return { dataTypes: coerceStringArray(value), converted: false };
+  }
+
+  const dataTypeString = coerceString(value);
+  if (!dataTypeString) {
+    return { dataTypes: [], converted: false };
+  }
+
+  return { dataTypes: [dataTypeString], converted: true };
+}
+
+function deriveSynthesisPurpose(persona?: string | SynthesisCallPersona): SynthesisCallPurpose {
+  switch (persona) {
+    case "synthesis-source-compression":
+      return "source-abstracts";
+    case "synthesis-review":
+      return "review";
+    case "synthesis-writing":
+      return "writing";
+    default:
+      return "other";
+  }
+}
+
+function maybeCoerceSourceAbstractPayload(raw: unknown): JsonExtractionResult {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { value: raw };
+  const obj = raw as {
+    synthesis?: unknown;
+    sourceId?: string;
+    synthesisNotes?: unknown;
+    sourceAbstracts?: unknown;
+  };
+
+  if (!Array.isArray(obj.synthesis)) return { value: raw };
+
+  const sourceAbstracts = obj.synthesis
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const sourceEntry = entry as Record<string, unknown>;
+      const source = coerceString(sourceEntry.source, coerceString(sourceEntry.sourceId, ""));
+      if (!source) return null;
+      return {
+        source,
+        methodology: coerceString(sourceEntry.methodology, "Legacy source abstract payload omitted methodology."),
+        temporalContext: coerceString(sourceEntry.temporalContext, "Unknown temporal context."),
+        dataTypes: coerceStringArray(sourceEntry.dataTypes),
+        stakeholderPosition: coerceString(
+          sourceEntry.stakeholderPosition,
+          "Legacy source abstract payload omitted stakeholder position."
+        ),
+        representativeClaims: coerceStringArray(sourceEntry.representativeClaims),
+        keyConstraints: coerceStringArray(sourceEntry.keyConstraints),
+      };
+    })
+    .filter(
+      (
+        entry
+      ): entry is {
+        source: string;
+        methodology: string;
+        temporalContext: string;
+        dataTypes: string[];
+        stakeholderPosition: string;
+        representativeClaims: string[];
+        keyConstraints: string[];
+      } => entry !== null
+    );
+
+  if (sourceAbstracts.length === 0) return { value: raw };
+
+  return {
+    value: {
+      sourceAbstracts,
+      synthesisNotes: coerceStringArray(obj.synthesisNotes),
+    },
+    schemaCompatMode: "legacy-source-abstracts-shim",
+  };
+}
+
+function maybeCoerceSourceAbstractDataTypes(raw: unknown): JsonExtractionResult {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { value: raw };
+
+  const obj = raw as {
+    sourceAbstracts?: unknown;
+    synthesisNotes?: unknown;
+  };
+  if (!Array.isArray(obj.sourceAbstracts)) return { value: raw };
+
+  let needsCompatibility = false;
+  const sourceAbstracts = obj.sourceAbstracts
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const sourceEntry = entry as Record<string, unknown>;
+      const dataTypes = coerceSourceAbstractDataTypes(sourceEntry.dataTypes);
+      if (dataTypes.converted) needsCompatibility = true;
+      return { ...sourceEntry, dataTypes: dataTypes.dataTypes };
+    })
+    .filter((entry) => entry !== null);
+
+  if (!needsCompatibility || sourceAbstracts.length === 0) return { value: raw };
+
+  return {
+    value: {
+      ...obj,
+      sourceAbstracts,
+      synthesisNotes: coerceStringArray(obj.synthesisNotes),
+    },
+    schemaCompatMode: "legacy-source-abstracts-shim",
+  };
+}
+
+function mapReviewLegacyItems(
+  items: unknown,
+  kind: "summaryIssues" | "keyFindingsIssues",
+  findIdxStart: number
+): Array<{ findingId: string; issue: string; why: string; strengtheningAlternative: string }> {
+  if (!Array.isArray(items)) return [];
+
+  return items
+    .map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const issue = entry as Record<string, unknown>;
+      const findingId = coerceString(
+        issue.id,
+        `${kind}-${findIdxStart + index + 1}`
+      );
+      const issueText = coerceString(
+        issue.sentence ?? issue.issue ?? issue.text ?? issue.findingId,
+        "Legacy review item lacks a specific issue statement."
+      );
+      const why = coerceString(
+        issue.details ?? issue.why,
+        issueText
+      );
+      const strengtheningAlternative = coerceString(
+        issue.suggestedRevision ?? issue.alternative ?? issue.evidenceNeeded,
+        "No specific revision text provided; validate directly against source evidence."
+      );
+
+      return {
+        findingId,
+        issue: issueText,
+        why,
+        strengtheningAlternative,
+      };
+    })
+    .filter((entry): entry is {
+      findingId: string;
+      issue: string;
+      why: string;
+      strengtheningAlternative: string;
+    } => entry !== null);
+}
+
+function mapReviewUnsupportedConclusions(
+  items: unknown,
+  findIdxStart = 0
+): {
+  issues: Array<{ findingId: string; issue: string; why: string; strengtheningAlternative: string }>;
+  converted: boolean;
+} {
+  if (!Array.isArray(items)) return { issues: [], converted: false };
+
+  let converted = false;
+  const issues = items
+    .map((entry, index) => {
+      if (typeof entry === "string") {
+        const issueText = coerceString(entry, "");
+        if (!issueText) return null;
+        converted = true;
+        return {
+          findingId: `legacy-${findIdxStart + index + 1}`,
+          issue: issueText,
+          why: `Legacy review output provided a string unsupported-conclusion entry.`,
+          strengtheningAlternative:
+            "Rework or remove this conclusion to align with explicit source evidence.",
+        };
+      }
+
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const issue = entry as Record<string, unknown>;
+      const findingIdSource = issue.findingId ?? issue.id ?? issue.finding;
+      const issueSource = issue.issue ?? issue.statement ?? issue.sentence ?? issue.text;
+      const whySource = issue.why ?? issue.reason ?? issue.details;
+      const revisionSource =
+        issue.strengtheningAlternative ??
+        issue.revision ??
+        issue.suggestedRevision ??
+        issue.nextStep;
+      const findingId = coerceString(findingIdSource, `legacy-${findIdxStart + index + 1}`);
+      const issueText = coerceString(
+        issueSource,
+        coerceString(issue.issueId, "")
+      );
+      if (!issueText) return null;
+      const why = coerceString(
+        whySource,
+        `Legacy review output did not include a why. ${issueText}`
+      );
+      const strengtheningAlternative = coerceString(
+        revisionSource,
+        "Please revise this conclusion with more precise source support."
+      );
+      if (
+        typeof findingIdSource !== "string" ||
+        typeof issueSource !== "string" ||
+        typeof whySource !== "string" ||
+        typeof revisionSource !== "string"
+      ) {
+        converted = true;
+      }
+
+      return {
+        findingId,
+        issue: issueText,
+        why,
+        strengtheningAlternative,
+      };
+    })
+    .filter((entry): entry is {
+      findingId: string;
+      issue: string;
+      why: string;
+      strengtheningAlternative: string;
+    } => entry !== null);
+
+  return { issues, converted };
+}
+
+function mapReviewLegacyMissingEvidence(items: unknown): string[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const itemObj = item as Record<string, unknown>;
+      const evidence = coerceString(itemObj.evidenceNeeded, "");
+      return evidence || null;
+    })
+    .filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
+function mapReviewLegacyRecommendations(items: unknown): string[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) => {
+      if (typeof item === "string") return coerceString(item, "");
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        const itemObj = item as Record<string, unknown>;
+        const text = coerceString(itemObj.text, itemObj.recommendation as unknown as string);
+        return coerceString(text, "");
+      }
+      return "";
+    })
+    .filter((item): item is string => item.length > 0);
+}
+
+function maybeCoerceReviewPayload(raw: unknown): JsonExtractionResult {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { value: raw };
+  const obj = raw as Record<string, unknown>;
+  const unsupportedConclusionsFromStrings = mapReviewUnsupportedConclusions(
+    obj.unsupportedConclusions,
+    0
+  );
+
+  const summaryIssues = obj.summaryIssues;
+  const keyFindingsIssues = obj.keyFindingsIssues;
+  const recommendationsIssues = obj.recommendationsIssues;
+  if (
+    summaryIssues === undefined &&
+    keyFindingsIssues === undefined &&
+    recommendationsIssues === undefined
+  ) {
+    if (unsupportedConclusionsFromStrings.converted) {
+      return {
+        value: {
+          ...obj,
+          unsupportedConclusions: unsupportedConclusionsFromStrings.issues,
+        },
+        schemaCompatMode: "legacy-review-unsupported-items-shim",
+      };
+    }
+    return { value: raw };
+  }
+
+  const unsupportedConclusions = [
+    ...mapReviewLegacyItems(summaryIssues, "summaryIssues", 0),
+    ...mapReviewLegacyItems(keyFindingsIssues, "keyFindingsIssues", 0),
+    ...unsupportedConclusionsFromStrings.issues,
+  ];
+
+  return {
+    value: {
+      verdict: unsupportedConclusions.length > 0 ? "revise" : "accept",
+      unsupportedConclusions,
+      missingEvidence: mapReviewLegacyMissingEvidence(
+        (Array.isArray(summaryIssues) ? summaryIssues : []).concat(
+          Array.isArray(keyFindingsIssues) ? keyFindingsIssues : []
+        )
+      ),
+      requestedRevisions: mapReviewLegacyRecommendations(recommendationsIssues),
+      confidenceRisk: undefined,
+    },
+    schemaCompatMode: unsupportedConclusionsFromStrings.converted
+      ? "legacy-review-unsupported-items-shim"
+      : "legacy-review-shim",
+  };
+}
+
+function maybeCoerceSchemaCompat(persona: string | undefined, json: unknown): JsonExtractionResult {
+  if (persona === "synthesis-source-compression") {
+    const legacyResult = maybeCoerceSourceAbstractPayload(json);
+    if (legacyResult.schemaCompatMode) return legacyResult;
+    return maybeCoerceSourceAbstractDataTypes(json);
+  }
+  if (persona === "synthesis-review") return maybeCoerceReviewPayload(json);
+  return { value: json };
+}
+
+function extractFirstJson(text: string): JsonExtractionResult {
+  const attempts = new Set<string>();
+  const candidates = extractJsonCandidates(text);
+  for (const candidate of candidates) {
+    const balanced = extractBalancedJsonPrefix(candidate);
+    const repaired = repairTruncatedJson(candidate);
+
+    if (balanced) attempts.add(balanced);
+    attempts.add(candidate);
+    if (repaired) attempts.add(repaired);
+  }
+  let lastError: Error | undefined;
+
+  for (const candidate of attempts) {
+    if (!candidate) continue;
+    try {
+      return { value: parseAttemptedJson(candidate) };
+    } catch (error) {
+      lastError =
+        error instanceof Error ? error : new Error(typeof error === "string" ? error : "Unknown JSON parse error");
+    }
+  }
+  if (lastError) throw lastError;
+  throw new Error("Unable to extract valid JSON from model response.");
 }
 
 function sha256Base64url(input: string): string {
   return crypto.createHash("sha256").update(input).digest("base64url");
 }
 
-async function callModelJsonLogged<T>(input: {
+async function callModelJsonLogged<TSchema extends z.ZodTypeAny>(input: {
   runId: string;
   userId: string;
-  phase: PipelinePhase;
+  phase: string;
+  persona?: string | SynthesisCallPersona;
+  synthesisPurpose?: SynthesisCallPurpose;
   provider: ModelProvider;
   model: string;
   messages: ChatMessage[];
-  schema: z.ZodType<T>;
+  schema: TSchema;
   store: PipelineStore;
   objectStore: ObjectStore;
   checkpoint: RunCheckpoint;
@@ -316,8 +808,23 @@ async function callModelJsonLogged<T>(input: {
   temperature?: number;
   maxTokens?: number;
   reasoningEffort: ThinkingMode;
-}): Promise<T> {
+}): Promise<z.output<TSchema>> {
   const temperature = input.temperature ?? 0.2;
+  const requestedMaxTokens =
+    typeof input.maxTokens === "number" && Number.isFinite(input.maxTokens)
+      ? input.maxTokens
+      : undefined;
+  const effectiveMaxTokens =
+    requestedMaxTokens === undefined
+      ? MODEL_CALL_MIN_OUTPUT_TOKENS
+      : Math.max(requestedMaxTokens, MODEL_CALL_MIN_OUTPUT_TOKENS);
+  const jsonOnlySystem: ChatMessage = {
+    role: "system",
+    content:
+      "Return only valid JSON. Do not include markdown, code fences, or extra commentary. " +
+      "If a field is unknown, use an empty string/array rather than prose.",
+  };
+  const messages: ChatMessage[] = [jsonOnlySystem, ...input.messages];
   const callId = crypto.randomUUID();
   const request: {
     model: string;
@@ -327,26 +834,95 @@ async function callModelJsonLogged<T>(input: {
     reasoning_effort?: ThinkingMode;
   } = {
     model: input.model,
-    messages: input.messages,
+    messages,
     temperature,
   };
-  if (input.maxTokens !== undefined) request.maxTokens = input.maxTokens;
+  if (effectiveMaxTokens !== undefined) request.maxTokens = effectiveMaxTokens;
   if (input.reasoningEffort !== undefined) request.reasoning_effort = input.reasoningEffort;
   const inputHash = sha256Base64url(JSON.stringify(request));
 
-  const requestKey = runArtifactKey(
-    input.runId,
-    `model-calls/${input.phase}/${callId}.request.json`
-  );
-  const responseKey = runArtifactKey(
-    input.runId,
-    `model-calls/${input.phase}/${callId}.response.json`
-  );
-  await input.objectStore.putJson(requestKey, request);
+  const requestKey = (attempt: number) =>
+    runArtifactKey(
+      input.runId,
+      `model-calls/${input.phase}/${callId}.attempt-${attempt}.request.json`
+    );
+  const responseKey = (attempt: number) =>
+    runArtifactKey(
+      input.runId,
+      `model-calls/${input.phase}/${callId}.attempt-${attempt}.response.json`
+    );
+  const persona =
+    typeof input.persona === "string" && input.persona.trim().length > 0
+      ? input.persona
+      : input.phase;
 
-  const persistResponse = async (value: unknown): Promise<boolean> => {
+  const callAttemptContext = {
+    persona,
+    phase: input.phase,
+    model: input.model,
+    reasoningEffort: input.reasoningEffort,
+    synthesisPurpose: input.synthesisPurpose ?? deriveSynthesisPurpose(persona),
+    requestedMaxTokens,
+    maxTokens: effectiveMaxTokens,
+    effectiveMaxTokens,
+  };
+
+  const emitRetryEvent = async (
+    attempt: number,
+    reason: string,
+    error: unknown,
+    extraData?: Record<string, unknown>
+  ): Promise<void> => {
+    const normalizedError =
+      error instanceof Error
+        ? { name: error.name, message: error.message, ...(error.stack ? { stack: error.stack } : {}) }
+        : { name: "UnknownError", message: String(error) };
+
+    await input.store
+      .addRunEvent({
+        runId: input.runId,
+        level: "warn",
+        phase: input.phase,
+        eventType: "model_call_retry",
+        message: `Retrying ${input.phase} model call after ${reason}`,
+        data: {
+          ...callAttemptContext,
+          modelCallId: callId,
+          attempt,
+          retryAttempt: attempt - 1,
+          maxRetries: MODEL_CALL_MAX_RETRIES,
+          maxAttempts: MODEL_CALL_MAX_ATTEMPTS,
+          errorName: normalizedError.name,
+          errorMessage: normalizedError.message,
+          ...(extraData ? extraData : {}),
+        },
+      })
+      .catch(() => {});
+  };
+
+  await input.store
+    .addRunEvent({
+      runId: input.runId,
+      level: "info",
+      phase: input.phase,
+      eventType: "model_call_started",
+      message: `Launching ${input.phase} model call with ${input.model}`,
+      data: {
+        ...callAttemptContext,
+        modelCallId: callId,
+        retryAttempt: 0,
+        maxRetries: MODEL_CALL_MAX_RETRIES,
+        maxAttempts: MODEL_CALL_MAX_ATTEMPTS,
+      },
+    })
+    .catch(() => {});
+
+  const persistResponse = async (
+    value: unknown,
+    responseArtifact: string
+  ): Promise<boolean> => {
     try {
-      await input.objectStore.putJson(responseKey, value);
+      await input.objectStore.putJson(responseArtifact, value);
       return true;
     } catch {
       return false;
@@ -358,23 +934,34 @@ async function callModelJsonLogged<T>(input: {
     name: string;
     stack?: string;
     reason?: string;
+    rawResponse?: string;
+    rawResponseLength?: number;
+    rawResponsePreview?: string;
+    attempt?: number;
+    responseArtifact: string;
   }): Promise<void> => {
-    const written = await persistResponse({
-      error: true,
-      phase: input.phase,
-      model: input.model,
-      ...payload,
-    });
+    const written = await persistResponse(
+      {
+        error: true,
+        phase: input.phase,
+        model: input.model,
+        ...payload,
+      },
+      payload.responseArtifact
+    );
     if (written) return;
-    await persistResponse({
-      error: true,
-      phase: input.phase,
-      model: input.model,
-      name: "ModelResponsePersistenceError",
-      message: "Model response could not be persisted to object store",
-      reason: payload.reason ?? "unknown",
-      stack: payload.stack,
-    });
+    await persistResponse(
+      {
+        error: true,
+        phase: input.phase,
+        model: input.model,
+        name: "ModelResponsePersistenceError",
+        message: "Model response could not be persisted to object store",
+        reason: payload.reason ?? "unknown",
+        stack: payload.stack,
+      },
+      payload.responseArtifact
+    );
   };
 
   const normalizeResponse = (res: ChatCompletionResponse): {
@@ -399,10 +986,10 @@ async function callModelJsonLogged<T>(input: {
 
   const req: Parameters<ModelProvider["chat"]>[0] = {
     model: input.model,
-    messages: input.messages,
+    messages,
     temperature,
   };
-  if (input.maxTokens !== undefined) req.maxTokens = input.maxTokens;
+  if (effectiveMaxTokens !== undefined) req.maxTokens = effectiveMaxTokens;
   if (input.reasoningEffort !== undefined) req.reasoningEffort = input.reasoningEffort;
 
   const callError = (error: unknown): { message: string; name: string; stack?: string } => {
@@ -412,61 +999,183 @@ async function callModelJsonLogged<T>(input: {
     return { name: "UnknownError", message: String(error) };
   };
 
-  let res: ChatCompletionResponse;
-  try {
-    res = await input.provider.chat(req);
-  } catch (error) {
-    const normalizedError = callError(error);
-    await persistResponseError({
-      ...normalizedError,
-      reason: "provider chat failed",
-    });
-    throw error;
+  const isEmptyResponseError = (error: unknown): boolean =>
+    error instanceof Error && error.message.includes(MODEL_CALL_EMPTY_RESPONSE_MARKER);
+
+  for (let attempt = 1; attempt <= MODEL_CALL_MAX_ATTEMPTS; attempt += 1) {
+    const requestArtifact = requestKey(attempt);
+    const responseArtifact = responseKey(attempt);
+
+    input.checkpoint.counters.modelCalls++;
+    await input.objectStore.putJson(requestArtifact, request);
+
+    let res: ChatCompletionResponse;
+    try {
+      res = await input.provider.chat(req);
+    } catch (error) {
+      const isProviderEmptyResponse = isEmptyResponseError(error);
+      const normalizedError = callError(error);
+      await persistResponseError({
+        ...normalizedError,
+        reason: `${isProviderEmptyResponse ? "provider empty response" : "provider chat failed"} on attempt ${attempt}`,
+        attempt,
+        responseArtifact,
+      });
+
+      if (attempt < MODEL_CALL_MAX_ATTEMPTS) {
+        const reason = isProviderEmptyResponse ? "empty response" : "provider chat failure";
+        await emitRetryEvent(attempt, reason, error, {
+          ...(isProviderEmptyResponse ? { rawResponseLength: 0 } : {}),
+        });
+        continue;
+      }
+
+      throw error;
+    }
+
+    const normalizedResponse = normalizeResponse(res);
+    if (!normalizedResponse.text.trim()) {
+      const emptyResponseError = new Error(`${MODEL_CALL_EMPTY_RESPONSE_MARKER}: Empty model response`);
+      const normalizedEmptyError = callError(emptyResponseError);
+      const normalizedText = normalizedResponse.text;
+      await persistResponseError({
+        ...normalizedEmptyError,
+        reason: `response contained no text on attempt ${attempt}`,
+        attempt,
+        responseArtifact,
+        rawResponse: normalizedText,
+        rawResponseLength: normalizedText.length,
+      });
+
+      if (attempt < MODEL_CALL_MAX_ATTEMPTS) {
+        await emitRetryEvent(attempt, "empty response", emptyResponseError, {
+          rawResponsePreview: normalizedText,
+          rawResponseLength: normalizedText.length,
+        });
+        continue;
+      }
+
+      throw emptyResponseError;
+    }
+
+    const responsePersisted = await persistResponse(normalizedResponse, responseArtifact);
+    if (!responsePersisted) {
+      await persistResponseError({
+        name: "ModelResponsePersistenceError",
+        message: "Unable to persist model response",
+        reason: "response persist failed",
+        responseArtifact,
+        ...(normalizedResponse.text ? { stack: String(normalizedResponse.text).slice(0, 400) } : {}),
+      });
+    }
+
+    const outputHash = sha256Base64url(normalizedResponse.text);
+
+    const modelCall: Parameters<PipelineStore["addModelCall"]>[0] = {
+      runId: input.runId,
+      phase: input.phase,
+      modelId: input.model,
+      params: {
+        ...callAttemptContext,
+        modelCallId: callId,
+        retryAttempt: attempt - 1,
+        temperature,
+        maxTokensRequested: requestedMaxTokens,
+        maxTokens: effectiveMaxTokens,
+      },
+      promptVersion: input.promptVersion,
+      inputHash,
+      outputHash,
+      requestKey: requestArtifact,
+      responseKey: responseArtifact,
+    };
+    if (res.usage?.inputTokens !== undefined) modelCall.tokensIn = res.usage.inputTokens;
+    if (res.usage?.outputTokens !== undefined) modelCall.tokensOut = res.usage.outputTokens;
+    if (res.usage?.costUsd !== undefined) modelCall.costUsd = res.usage.costUsd;
+
+    try {
+      const extractedJson = extractFirstJson(normalizedResponse.text);
+      const compat = maybeCoerceSchemaCompat(persona, extractedJson.value);
+      const schemaCompatMode =
+        compat.schemaCompatMode ?? extractedJson.schemaCompatMode;
+      const parsed = input.schema.parse(compat.value);
+      const modelCallParams = {
+        ...callAttemptContext,
+        modelCallId: callId,
+        retryAttempt: attempt - 1,
+        temperature,
+        maxTokensRequested: requestedMaxTokens,
+        maxTokens: effectiveMaxTokens,
+        effectiveMaxTokens,
+        ...(schemaCompatMode ? { schemaCompatMode } : {}),
+      };
+      modelCall.params = modelCallParams;
+
+      await input.store.addModelCall(modelCall);
+      await input.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: input.phase,
+          eventType: "model_call_completed",
+          message: `Model call succeeded for ${input.phase}`,
+          data: {
+            ...modelCallParams,
+            retryAttempt: attempt - 1,
+            maxRetries: MODEL_CALL_MAX_RETRIES,
+            maxAttempts: MODEL_CALL_MAX_ATTEMPTS,
+          },
+        })
+        .catch(() => {});
+
+      if (res.usage) {
+        const usageDelta: Parameters<PipelineStore["addUsageDelta"]>[0] = { userId: input.userId };
+        if (res.usage.inputTokens !== undefined) usageDelta.modelTokensIn = res.usage.inputTokens;
+        if (res.usage.outputTokens !== undefined) usageDelta.modelTokensOut = res.usage.outputTokens;
+        if (res.usage.costUsd !== undefined) usageDelta.costUsd = res.usage.costUsd;
+        input.store.addUsageDelta(usageDelta).catch(() => {});
+      }
+
+      input.store.updateRun({ runId: input.runId, state: input.checkpoint }).catch(() => {});
+
+      return parsed;
+    } catch (error) {
+      const normalizedError = callError(error);
+      const responseText = normalizedResponse.text;
+      let parsedExtract: JsonExtractionResult | null = null;
+      try {
+        parsedExtract = extractFirstJson(responseText);
+      } catch {
+        parsedExtract = null;
+      }
+      const compat =
+        parsedExtract === null ? null : maybeCoerceSchemaCompat(persona, parsedExtract.value);
+      const schemaCompatMode =
+        compat?.schemaCompatMode ?? parsedExtract?.schemaCompatMode;
+      await persistResponseError({
+        ...normalizedError,
+        reason: `response parse/schema failed on attempt ${attempt}`,
+        attempt,
+        responseArtifact,
+        rawResponse: responseText,
+        rawResponseLength: responseText.length,
+        rawResponsePreview: responseText.slice(0, 500),
+      });
+      if (attempt < MODEL_CALL_MAX_ATTEMPTS) {
+        await emitRetryEvent(attempt, "response parse or schema validation", error, {
+          rawResponsePreview: responseText.slice(0, 500),
+          rawResponseLength: responseText.length,
+          ...(schemaCompatMode ? { schemaCompatMode } : {}),
+        });
+        continue;
+      }
+      throw error;
+    }
   }
 
-  const normalizedResponse = normalizeResponse(res);
-  const responsePersisted = await persistResponse(normalizedResponse);
-  if (!responsePersisted) {
-    await persistResponseError({
-      name: "ModelResponsePersistenceError",
-      message: "Unable to persist model response",
-      reason: "response persist failed",
-      ...(normalizedResponse.text ? { stack: String(normalizedResponse.text).slice(0, 400) } : {}),
-    });
-  }
-
-  const outputHash = sha256Base64url(normalizedResponse.text);
-
-  input.checkpoint.counters.modelCalls++;
-
-  const modelCall: Parameters<PipelineStore["addModelCall"]>[0] = {
-    runId: input.runId,
-    phase: input.phase,
-    modelId: input.model,
-    params: { temperature, maxTokens: input.maxTokens, reasoningEffort: input.reasoningEffort },
-    promptVersion: input.promptVersion,
-    inputHash,
-    outputHash,
-    requestKey,
-    responseKey,
-  };
-  if (res.usage?.inputTokens !== undefined) modelCall.tokensIn = res.usage.inputTokens;
-  if (res.usage?.outputTokens !== undefined) modelCall.tokensOut = res.usage.outputTokens;
-  if (res.usage?.costUsd !== undefined) modelCall.costUsd = res.usage.costUsd;
-  await input.store.addModelCall(modelCall);
-
-  if (res.usage) {
-    const usageDelta: Parameters<PipelineStore["addUsageDelta"]>[0] = { userId: input.userId };
-    if (res.usage.inputTokens !== undefined) usageDelta.modelTokensIn = res.usage.inputTokens;
-    if (res.usage.outputTokens !== undefined) usageDelta.modelTokensOut = res.usage.outputTokens;
-    if (res.usage.costUsd !== undefined) usageDelta.costUsd = res.usage.costUsd;
-    input.store.addUsageDelta(usageDelta).catch(() => {});
-  }
-
-  input.store.updateRun({ runId: input.runId, state: input.checkpoint }).catch(() => {});
-
-  const json = extractFirstJson(normalizedResponse.text);
-  return input.schema.parse(json);
+  throw new Error(
+    `Model call in ${input.phase} failed after ${MODEL_CALL_MAX_ATTEMPTS} attempts (${MODEL_CALL_MAX_RETRIES} retries)`
+  );
 }
 
 function coerceCitationPolicy(v: unknown, fallback: CitationPolicy): CitationPolicy {
@@ -516,15 +1225,18 @@ const CLAIM_SIMILARITY_RATIO = 0.82;
 const SYNTHESIS_MAX_SOURCES_FOR_MODEL = 20;
 const SYNTHESIS_MIN_PROMPT_TERM_SCORE = 0.08;
 const SYNTHESIS_TARGET_MIN_SUMMARY_WORDS = 320;
-const SYNTHESIS_REFINEMENT_ATTEMPTS = 2;
-const SYNTHESIS_REFINEMENT_OUTPUT_TARGET_MIN_SOURCES = 6;
+const SYNTHESIS_REFINEMENT_MAX_RETRIES = 3;
+const SYNTHESIS_REFINEMENT_ATTEMPTS = SYNTHESIS_REFINEMENT_MAX_RETRIES + 1;
+const MODEL_CALL_MIN_OUTPUT_TOKENS = 8_000;
+const MODEL_CALL_MAX_RETRIES = 3;
+const MODEL_CALL_MAX_ATTEMPTS = MODEL_CALL_MAX_RETRIES + 1;
 const SYNTHESIS_SOURCE_ABSTRACT_TRIGGER_SOURCE_COUNT = 8;
 const SYNTHESIS_MAX_SOURCE_ABSTRACTS = 24;
 const SYNTHESIS_MAX_CRITICAL_SOURCE_CONTEXTS = 6;
 const SYNTHESIS_MAX_CRITICAL_SOURCE_EXCERPT_CHARS = 3_600;
 const SYNTHESIS_MIN_REVIEW_SOURCE_COUNT = 2;
 const SYNTHESIS_MAX_ABSTRACT_TEXT_LENGTH = 1_600;
-const SYNTHESIS_MIN_SOURCE_INDEX_ENTRIES = 3;
+const SYNTHESIS_MIN_SOURCE_INDEX_ENTRIES = 2;
 const SYNTHESIS_MIN_QUOTE_TEXT_LENGTH = 80;
 const SYNTHESIS_OFFICIAL_DOMAIN_HINTS = [
   "gov",
@@ -611,8 +1323,20 @@ const SYNTHESIS_SOURCE_ABSTRACTS_OUTPUT_SCHEMA = z.object({
 });
 
 const SYNTHESIS_SOURCE_ABSTRACT_SYSTEM_PROMPT =
-  "Create concise source synthesis abstracts that capture methodology, temporal context, stakeholder position, and key constraints that limit inference. " +
-  "Return only structured information that is directly inferable from the provided source snippets.";
+  "Create concise source synthesis abstracts that capture methodology, temporal context, stakeholder position, and key constraints that limit inference.\n" +
+  "Return strict JSON only. Do not use markdown, code fences, comments, or prose.\n" +
+  "Output must be exactly this shape:\n" +
+  '{ \"sourceAbstracts\": [ { \"source\": \"S1\", \"methodology\": \"...\", \"temporalContext\": \"...\", \"dataTypes\": [\"...\"], \"stakeholderPosition\": \"...\", \"representativeClaims\": [\"...\"], \"keyConstraints\": [\"...\"] } ], \"synthesisNotes\": [\"...\"] }.\n' +
+  "Required keys for each sourceAbstract: source (string), methodology (string), temporalContext (string), dataTypes (string[]), stakeholderPosition (string), representativeClaims (string[]), keyConstraints (string[]).\n" +
+  "All string fields must be non-empty after trimming and all arrays should be omitted only if empty.";
+
+const SYNTHESIS_SYSTEM_REVIEW_SCHEMA_PROMPT =
+  " Return strict JSON only in the exact shape:\n" +
+  '{ \"verdict\": \"accept|revise|reject\", \"unsupportedConclusions\": [ { \"findingId\": \"string\", \"issue\": \"string\", \"why\": \"string\", \"strengtheningAlternative\": \"string\" } ], \"missingEvidence\": [\"string\"], \"requestedRevisions\": [\"string\"], \"confidenceRisk\": 0|1|...|10 }\n' +
+  "Do not use alternate keys like summaryIssues/keyFindingsIssues/recommendationsIssues. All strings must be non-empty and arrays may be empty.";
+
+const SYNTHESIS_SYSTEM_REVIEW_PROMPT_WITH_SCHEMA =
+  `${SYNTHESIS_SYSTEM_REVIEW_PROMPT}${SYNTHESIS_SYSTEM_REVIEW_SCHEMA_PROMPT}`;
 
 const SYNTHESIS_REVIEW_SCHEMA = z.object({
   verdict: z.enum(["accept", "revise", "reject"]),
@@ -693,6 +1417,41 @@ function coerceSynthesisConfig(v: unknown, fallback: SynthesisConfig): Synthesis
   return { maxInputTokens, maxOutputTokens };
 }
 
+function coerceResearchLoopConfig(v: unknown, fallback: ResearchLoopConfig): ResearchLoopConfig {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return fallback;
+  const o = v as {
+    enabled?: unknown;
+    maxIterations?: unknown;
+    sourcesPerIteration?: unknown;
+    mode?: unknown;
+    switchToHybridAfterRejects?: unknown;
+  };
+
+  const enabled = typeof o.enabled === "boolean" ? o.enabled : fallback.enabled;
+  const maxIterations = clampPositiveInteger(o.maxIterations, fallback.maxIterations);
+  const mode = o.mode === "auto" || o.mode === "incremental" || o.mode === "hybrid" ? o.mode : fallback.mode;
+  const switchToHybridAfterRejects = clampPositiveInteger(
+    o.switchToHybridAfterRejects,
+    fallback.switchToHybridAfterRejects
+  );
+
+  const sourcesPerIteration =
+    typeof o.sourcesPerIteration === "number" &&
+    Number.isFinite(o.sourcesPerIteration) &&
+    Number.isInteger(o.sourcesPerIteration) &&
+    o.sourcesPerIteration > 0
+      ? o.sourcesPerIteration
+      : fallback.sourcesPerIteration;
+
+  return {
+    enabled,
+    maxIterations,
+    mode,
+    switchToHybridAfterRejects,
+    ...(sourcesPerIteration !== undefined ? { sourcesPerIteration } : {}),
+  };
+}
+
 export async function runResearchPipeline(input: {
   runId: string;
   config: OpenResearchConfig;
@@ -716,6 +1475,7 @@ export async function runResearchPipeline(input: {
   const fullProfile = input.config.policies.qualityProfiles.full;
   const fullProfileAgenticLoop = fullProfile.agenticLoop ?? AgenticLoopConfigSchema.parse({});
   const fullProfileSynthesis = fullProfile.synthesis ?? SynthesisConfigSchema.parse({});
+  const fullProfileResearchLoop = fullProfile.researchLoop ?? ResearchLoopConfigSchema.parse({});
   const thinkingMode = coerceThinkingMode(adapterConfigObject);
   const agenticLoop = coerceAgenticLoopConfig(
     adapterConfigObject.agenticLoop,
@@ -724,6 +1484,10 @@ export async function runResearchPipeline(input: {
   const synthesisConfig = coerceSynthesisConfig(
     adapterConfigObject.synthesis,
     fullProfileSynthesis
+  );
+  const researchLoopConfig = coerceResearchLoopConfig(
+    adapterConfigObject.researchLoop,
+    fullProfileResearchLoop
   );
   const maxSynthesisInputTokens = Math.max(1, synthesisConfig.maxInputTokens);
   const maxSynthesisOutputTokens = Math.min(
@@ -986,33 +1750,119 @@ export async function runResearchPipeline(input: {
         );
         if (!plan) throw new Error("Missing plan artifact");
 
-        const retrievalKey = checkpoint.artifacts.retrievalKey ?? runRetrievalKey(run.id);
-        let retrieval = await input.services.objectStore.getJson<RetrievalOutput>(retrievalKey);
-        if (!retrieval) {
-          retrieval = await retrievePhase({
+        if (researchLoopConfig.enabled) {
+          await runResearchLoop({
             runId: run.id,
             userId: run.user_id,
+            prompt: run.prompt,
+            citationPolicy,
             budgets,
-            queries: plan.queries,
-            search: input.services.search,
-            store: input.services.store,
+            models,
+            thinkingMode,
+            loopConfig: researchLoopConfig,
+            deadlineMs: deadline,
+            services: {
+              store: input.services.store,
+              objectStore: input.services.objectStore,
+              search: input.services.search,
+              httpFetch: input.services.httpFetch,
+              ...(input.services.browserRender ? { browserRender: input.services.browserRender } : {}),
+              ...(input.services.modelProvider ? { modelProvider: input.services.modelProvider } : {}),
+            },
+            checkpoint,
+            synthesis: {
+              maxInputTokens: Math.min(maxSynthesisInputTokens, MANAGED_SYNTHESIS_CONTEXT_TOKEN_WINDOW),
+              maxOutputTokens: maxSynthesisOutputTokens,
+              contextWindowTokens: Math.min(
+                maxSynthesisInputTokens,
+                MANAGED_SYNTHESIS_CONTEXT_TOKEN_WINDOW
+              ),
+              requestedMaxInputTokens: maxSynthesisInputTokens,
+              requestedMaxOutputTokens: maxSynthesisOutputTokens,
+            },
+            steps: {
+              retrieve: retrievePhase,
+              fetch: fetchPhase,
+              extract: extractPhase,
+              loadLabeledSources,
+              synthesize: synthesizePhase,
+              review: async (reviewInput) => {
+                const sourcesForReview: SynthesisSourceBrief[] = reviewInput.sources.map((s) => ({
+                  source: s.label,
+                  url: s.url,
+                  title: s.title,
+                  publisher: s.publisher,
+                  ...(s.contentText !== undefined ? { fullText: s.contentText } : {}),
+                  quotes: s.quotes.map((q) => ({
+                    quoteId: q.quoteId,
+                    start: q.start,
+                    end: q.end,
+                    text: q.text,
+                  })),
+                }));
+                const review = await reviewSynthesisDraft({
+                  runId: reviewInput.runId,
+                  userId: reviewInput.userId,
+                  prompt: reviewInput.prompt,
+                  sources: sourcesForReview,
+                  synthesis: reviewInput.synthesis,
+                  provider: reviewInput.provider,
+                  model: reviewInput.model,
+                  thinkingMode: reviewInput.thinkingMode,
+                  store: reviewInput.store,
+                  objectStore: reviewInput.objectStore,
+                  checkpoint: reviewInput.checkpoint,
+                });
+                return {
+                  verdict: review.verdict,
+                  unsupportedConclusions: review.unsupportedConclusions ?? [],
+                  missingEvidence: review.missingEvidence ?? [],
+                  requestedRevisions: review.requestedRevisions ?? [],
+                  confidenceRisk: review.confidenceRisk,
+                };
+              },
+              callModelJsonLogged,
+            },
           });
-          await input.services.objectStore.putJson(retrievalKey, retrieval);
-        }
-        checkpoint.artifacts.retrievalKey = retrievalKey;
-        checkpoint.selectedUrls = retrieval.selectedUrls;
 
-        if (!checkpoint.sourceIds) {
-          checkpoint.sourceIds = [];
-          for (const url of retrieval.selectedUrls) {
-            const src = await input.services.store.createSource({ runId: run.id, url });
-            checkpoint.sourceIds.push(src.id);
+          checkpoint.nextPhase = "verify";
+          await input.services.store.updateRun({ runId: run.id, phase: "verify", state: checkpoint });
+          await completePhase("retrieve");
+        } else {
+          const retrievalKey = checkpoint.artifacts.retrievalKey ?? runRetrievalKey(run.id);
+          let retrieval = await input.services.objectStore.getJson<RetrievalOutput>(retrievalKey);
+          if (!retrieval) {
+            retrieval = await retrievePhase({
+              runId: run.id,
+              userId: run.user_id,
+              budgets,
+              queries: plan.queries,
+              search: input.services.search,
+              store: input.services.store,
+              maxSelectedUrls: budgets.maxSources,
+              seenUrls: new Set(),
+            });
+            await input.services.objectStore.putJson(retrievalKey, retrieval);
           }
-        }
+          checkpoint.artifacts.retrievalKey = retrievalKey;
+          checkpoint.selectedUrls = retrieval.selectedUrls;
 
-        checkpoint.nextPhase = "fetch";
-        await input.services.store.updateRun({ runId: run.id, phase: "fetch", state: checkpoint });
-        await completePhase("retrieve");
+          if (!checkpoint.sourceIds) {
+            checkpoint.sourceIds = [];
+            for (const url of retrieval.selectedUrls) {
+              const src = await input.services.store.createSource({ runId: run.id, url });
+              checkpoint.sourceIds.push(src.id);
+            }
+          }
+
+          checkpoint.nextPhase = "fetch";
+          await input.services.store.updateRun({
+            runId: run.id,
+            phase: "fetch",
+            state: checkpoint,
+          });
+          await completePhase("retrieve");
+        }
       }
 
       if (phase === "fetch") {
@@ -1281,12 +2131,16 @@ async function retrievePhase(input: {
   queries: string[];
   search: SearchAdapter;
   store: PipelineStore;
+  maxSelectedUrls: number;
+  seenUrls: Set<string>;
 }): Promise<RetrievalOutput> {
   const qOut: RetrievalOutput["queries"] = [];
-  const urlSet = new Set<string>();
+  const selectedUrls = new Set<string>();
+  const seenUrls = input.seenUrls ?? new Set<string>();
+  const maxSelectedUrls = Math.max(0, Math.floor(input.maxSelectedUrls));
 
   for (const q of input.queries) {
-    if (urlSet.size >= input.budgets.maxSources) break;
+    if (selectedUrls.size >= maxSelectedUrls) break;
     await input.store.addRunEvent({
       runId: input.runId,
       level: "info",
@@ -1296,7 +2150,9 @@ async function retrievePhase(input: {
       data: { query: q },
     });
 
-    const results = await input.search.search(q, { maxResults: input.budgets.maxSources });
+    const results = await input.search.search(q, {
+      maxResults: Math.max(1, input.budgets.maxSources),
+    });
     input.store.addUsageDelta({ userId: input.userId, searchCalls: 1 }).catch(() => {});
 
     await input.store.addRunEvent({
@@ -1319,10 +2175,11 @@ async function retrievePhase(input: {
     });
     for (const r of results) {
       const url = normalizeUrl(r.url);
-      const isNew = !urlSet.has(url);
-      urlSet.add(url);
-      if (urlSet.size >= input.budgets.maxSources) break;
-      if (isNew) {
+      const isNew = !selectedUrls.has(url) && !seenUrls.has(url);
+      if (!isNew) continue;
+      selectedUrls.add(url);
+      if (selectedUrls.size >= maxSelectedUrls) break;
+      {
         await input.store.addRunEvent({
           runId: input.runId,
           level: "info",
@@ -1340,7 +2197,10 @@ async function retrievePhase(input: {
     }
   }
 
-  return { queries: qOut, selectedUrls: Array.from(urlSet).slice(0, input.budgets.maxSources) };
+  return {
+    queries: qOut,
+    selectedUrls: Array.from(selectedUrls).slice(0, maxSelectedUrls),
+  };
 }
 
 async function fetchPhase(input: {
@@ -1351,60 +2211,64 @@ async function fetchPhase(input: {
   store: PipelineStore;
   objectStore: ObjectStore;
   httpFetch: HttpFetchAdapter;
+  onlySourceIds?: string[];
 }): Promise<void> {
   const sources = await input.store.listSources(input.runId);
+  const sourceIdAllowList =
+    input.onlySourceIds && input.onlySourceIds.length > 0 ? new Set(input.onlySourceIds) : null;
+  const eligibleSources = sourceIdAllowList ? sources.filter((s) => sourceIdAllowList.has(s.id)) : sources;
   const limit = pLimit(input.budgets.fetchConcurrency);
 
   await Promise.all(
-    sources.map((s) =>
+    eligibleSources.map((s) =>
       limit(async () => {
         if (input.checkpoint.counters.fetches >= input.budgets.maxFetches) return;
-    if (s.status !== "pending") return;
+        if (s.status !== "pending") return;
 
-      await input.store.addRunEvent({
-        runId: input.runId,
-        level: "info",
-        phase: "fetch",
-        eventType: "source_fetch_started",
-        message: `Fetching ${s.url}`,
-        data: { sourceId: s.id, url: s.url },
-      });
+        await input.store.addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "fetch",
+          eventType: "source_fetch_started",
+          message: `Fetching ${s.url}`,
+          data: { sourceId: s.id, url: s.url },
+        });
 
-    const res = await input.httpFetch.fetch(s.url);
-    input.checkpoint.counters.fetches++;
-    input.store.addUsageDelta({ userId: input.userId, fetches: 1 }).catch(() => {});
+        const res = await input.httpFetch.fetch(s.url);
+        input.checkpoint.counters.fetches++;
+        input.store.addUsageDelta({ userId: input.userId, fetches: 1 }).catch(() => {});
 
-    if (!res.ok) {
-      await input.store.addRunEvent({
-        runId: input.runId,
-        level: "warn",
-        phase: "fetch",
-        eventType: "source_fetch_failed",
-        message: `Fetch failed: ${s.url}`,
-        data: { sourceId: s.id, url: s.url, status: res.status, error: res.error },
-      });
-      await input.store.updateSource({
-        sourceId: s.id,
-        status: "failed",
-        error: { error: res.error, status: res.status },
-      });
-      return;
+        if (!res.ok) {
+          await input.store.addRunEvent({
+            runId: input.runId,
+            level: "warn",
+            phase: "fetch",
+            eventType: "source_fetch_failed",
+            message: `Fetch failed: ${s.url}`,
+            data: { sourceId: s.id, url: s.url, status: res.status, error: res.error },
+          });
+          await input.store.updateSource({
+            sourceId: s.id,
+            status: "failed",
+            error: { error: res.error, status: res.status },
+          });
+          return;
         }
 
-      const key = sourceRawBodyKey(input.runId, s.id);
-      await input.objectStore.putBytes(key, res.body);
-      await input.store.addRunEvent({
-        runId: input.runId,
-        level: "info",
-        phase: "fetch",
-        eventType: "source_fetch_completed",
-        message: `Fetched ${s.url}`,
-        data: { sourceId: s.id, url: s.url, status: res.status },
-      });
-      await input.store.updateSource({
-        sourceId: s.id,
-        status: "fetched",
-        finalUrl: res.url,
+        const key = sourceRawBodyKey(input.runId, s.id);
+        await input.objectStore.putBytes(key, res.body);
+        await input.store.addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "fetch",
+          eventType: "source_fetch_completed",
+          message: `Fetched ${s.url}`,
+          data: { sourceId: s.id, url: s.url, status: res.status },
+        });
+        await input.store.updateSource({
+          sourceId: s.id,
+          status: "fetched",
+          finalUrl: res.url,
           httpStatus: res.status,
           contentType: res.contentType,
           fetchedAt: new Date(),
@@ -1425,28 +2289,84 @@ async function extractPhase(input: {
   store: PipelineStore;
   objectStore: ObjectStore;
   browser: BrowserRenderAdapter | undefined;
+  onlySourceIds?: string[];
 }): Promise<void> {
   const sources = await input.store.listSources(input.runId);
+  const sourceIdAllowList =
+    input.onlySourceIds && input.onlySourceIds.length > 0 ? new Set(input.onlySourceIds) : null;
+  const eligibleSources = sourceIdAllowList ? sources.filter((s) => sourceIdAllowList.has(s.id)) : sources;
   const limit = pLimit(input.budgets.extractConcurrency);
 
   const shouldDebugCapture = input.checkpoint.debug.enabled;
+  const serializeError = (error: unknown): string => {
+    if (error instanceof Error) return error.message;
+    if (error && typeof error === "object" && "message" in error) {
+      return String((error as { message?: unknown }).message);
+    }
+    return String(error);
+  };
 
-  await Promise.all(
-    sources.map((s) =>
-      limit(async () => {
-    if (s.extract_key) return;
-    if (s.status !== "fetched" && s.status !== "rendered") return;
+  const serializeErrorName = (error: unknown): string => {
+    if (error instanceof Error) return error.name;
+    if (error && typeof error === "object" && "name" in error && typeof (error as { name?: unknown }).name === "string") {
+      return (error as { name?: string }).name!;
+    }
+    return "Error";
+  };
 
+  const markSourceExtractFailed = async (
+    source: (typeof eligibleSources)[number],
+    details: {
+      reason: string;
+      errorName?: string;
+      errorMessage?: string;
+      errorType?: string | undefined;
+    }
+  ) => {
     await input.store.addRunEvent({
       runId: input.runId,
-      level: "info",
+      level: "warn",
       phase: "extract",
-      eventType: "source_extract_started",
-      message: `Extracting evidence from ${s.url}`,
-      data: { sourceId: s.id, url: s.url },
+      eventType: "source_extract_failed",
+      message: `Extraction failed: ${source.url}`,
+      data: {
+        sourceId: source.id,
+        url: source.url,
+        errorName: details.errorName,
+        errorMessage: details.errorMessage,
+        errorType: details.errorType,
+        reason: details.reason,
+      },
     });
+    await input.store.updateSource({
+      sourceId: source.id,
+      status: "failed",
+      error: {
+        reason: details.reason,
+        name: details.errorName,
+        message: details.errorMessage,
+        type: details.errorType,
+      },
+    });
+  };
 
-    let evidence: ExtractedEvidence | null = null;
+  await Promise.all(
+    eligibleSources.map((s) =>
+      limit(async () => {
+        if (s.extract_key) return;
+        if (s.status !== "fetched" && s.status !== "rendered") return;
+
+        await input.store.addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "extract",
+          eventType: "source_extract_started",
+          message: `Extracting evidence from ${s.url}`,
+          data: { sourceId: s.id, url: s.url },
+        });
+
+        let evidence: ExtractedEvidence | null = null;
+        let extractionFailureType: "stack_overflow" | undefined;
         if (s.render_text_key) {
           const rendered = await input.objectStore.getText(s.render_text_key);
           if (rendered)
@@ -1455,13 +2375,62 @@ async function extractPhase(input: {
           const bytes = await input.objectStore.getBytes(s.raw_body_key);
           if (bytes) {
             const html = new TextDecoder().decode(bytes);
-            evidence = extractFromHtml(html, { url: s.final_url ?? s.url });
+            try {
+              evidence = extractFromHtml(html, { url: s.final_url ?? s.url });
+            } catch (error) {
+              const errorName = serializeErrorName(error);
+              const errorMessage = serializeError(error);
+              if (isExtractStackOverflowError(error)) {
+                extractionFailureType = "stack_overflow";
+                await input.store.addRunEvent({
+                  runId: input.runId,
+                  level: "warn",
+                  phase: "extract",
+                  eventType: "source_extract_fallback",
+                  message: `Falling back to text extraction due stack overflow: ${s.url}`,
+                  data: {
+                    sourceId: s.id,
+                    url: s.url,
+                    errorName,
+                    errorMessage,
+                    errorType: "stack_overflow",
+                  },
+                });
+
+                const fallbackEvidence = extractTextFromHtml(html, {
+                  title: s.title,
+                  publisher: s.publisher,
+                });
+
+                if (!fallbackEvidence || fallbackEvidence.contentText.length < 500) {
+                  await markSourceExtractFailed(s, {
+                    reason: "fallback_content_too_short",
+                    errorName,
+                    errorMessage,
+                    errorType: extractionFailureType,
+                  });
+                  return;
+                }
+
+                evidence = fallbackEvidence;
+                extractionFailureType = undefined;
+              }
+
+              await markSourceExtractFailed(s, {
+                reason: "extraction_error",
+                errorName,
+                errorMessage,
+                errorType: errorName,
+              });
+              return;
+            }
           }
         }
 
         const tooShort = !evidence || evidence.contentText.length < 500;
         if (
           tooShort &&
+          extractionFailureType !== "stack_overflow" &&
           input.browser &&
           input.checkpoint.counters.renders < input.budgets.maxBrowserRenders
         ) {
@@ -1502,39 +2471,28 @@ async function extractPhase(input: {
         }
 
         if (!evidence || evidence.contentText.trim().length === 0) {
-          await input.store.addRunEvent({
-            runId: input.runId,
-            level: "warn",
-            phase: "extract",
-            eventType: "source_extract_failed",
-            message: `Extraction failed: ${s.url}`,
-            data: {
-              sourceId: s.id,
-              url: s.url,
-              error: "extraction_failed",
-            },
-          });
-          await input.store.updateSource({
-            sourceId: s.id,
-            status: "failed",
-            error: { error: "extraction_failed" },
+          await markSourceExtractFailed(s, {
+            reason: "empty_content",
+            errorName: "extraction_failed",
+            errorMessage: "no_content",
+            errorType: extractionFailureType,
           });
           return;
         }
 
         const evidenceKey = sourceEvidenceKey(input.runId, s.id);
-    await input.objectStore.putJson(evidenceKey, evidence);
-    await input.store.addRunEvent({
-      runId: input.runId,
-      level: "info",
-      phase: "extract",
-      eventType: "source_extract_completed",
-      message: `Extraction completed: ${s.url}`,
-      data: { sourceId: s.id, url: s.url },
-    });
-    await input.store.updateSource({
-      sourceId: s.id,
-      status: "extracted",
+        await input.objectStore.putJson(evidenceKey, evidence);
+        await input.store.addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "extract",
+          eventType: "source_extract_completed",
+          message: `Extraction completed: ${s.url}`,
+          data: { sourceId: s.id, url: s.url },
+        });
+        await input.store.updateSource({
+          sourceId: s.id,
+          status: "extracted",
           extractKey: evidenceKey,
           title: evidence.metadata.title,
           publisher: evidence.metadata.publisher,
@@ -1554,6 +2512,25 @@ async function loadLabeledSources(input: {
 }): Promise<LabeledSource[]> {
   const sources = await input.store.listSources(input.runId);
   const extracted = sources.filter((s) => Boolean(s.extract_key));
+  const sourceLabels: Record<string, string> = { ...(input.checkpoint.sourceLabels ?? {}) };
+  const usedLabelNumbers = new Set<number>();
+  for (const label of Object.values(sourceLabels)) {
+    const match = /^S(\d+)$/.exec(label);
+    if (!match) continue;
+    const value = Number.parseInt(match[1]!, 10);
+    if (Number.isFinite(value) && value > 0) usedLabelNumbers.add(value);
+  }
+  let nextLabelNumber = usedLabelNumbers.size ? Math.max(...Array.from(usedLabelNumbers)) + 1 : 1;
+  const ensureSourceLabel = (sourceId: string): string => {
+    const existing = sourceLabels[sourceId];
+    if (typeof existing === "string" && existing.trim()) return existing;
+    while (usedLabelNumbers.has(nextLabelNumber)) nextLabelNumber += 1;
+    const assigned = `S${nextLabelNumber}`;
+    sourceLabels[sourceId] = assigned;
+    usedLabelNumbers.add(nextLabelNumber);
+    nextLabelNumber += 1;
+    return assigned;
+  };
   const toIso = (v: unknown): string => {
     if (typeof v === "string") return v;
     if (v instanceof Date) return v.toISOString();
@@ -1562,9 +2539,8 @@ async function loadLabeledSources(input: {
   extracted.sort((a, b) => toIso(a.fetched_at).localeCompare(toIso(b.fetched_at)));
 
   const labeled: LabeledSource[] = [];
-  let idx = 1;
   for (const s of extracted) {
-    const label = `S${idx++}`;
+    const label = ensureSourceLabel(s.id);
     const ev = await input.objectStore.getJson<ExtractedEvidence>(
       sourceEvidenceKey(input.runId, s.id)
     );
@@ -1581,6 +2557,7 @@ async function loadLabeledSources(input: {
       quotes,
     });
   }
+  input.checkpoint.sourceLabels = sourceLabels;
   return labeled;
 }
 
@@ -2015,8 +2992,11 @@ function summarizeSynthesisSources(input: {
     );
 
     const keptQuotes: typeof source.quotes = [];
+    const hasStrongMatch = sortedCandidates.some(
+      (candidate) => candidate.score >= SYNTHESIS_MIN_PROMPT_TERM_SCORE
+    );
     for (const candidate of sortedCandidates) {
-      if (candidate.score < SYNTHESIS_MIN_PROMPT_TERM_SCORE) {
+      if (hasStrongMatch && candidate.score < SYNTHESIS_MIN_PROMPT_TERM_SCORE) {
         droppedQuoteCount++;
         continue;
       }
@@ -2045,6 +3025,19 @@ function summarizeSynthesisSources(input: {
       }
     }
 
+    if (keptQuotes.length === 0 && sortedCandidates.length > 0) {
+      const fallback = sortedCandidates[0]!;
+      keptQuotes.push({
+        quoteId: fallback.quoteId,
+        start: fallback.start,
+        end: fallback.end,
+        text: summarizeClaimText(fallback.text),
+      });
+      if (fallback.normalizedText.length > 0 && !seenClaims.includes(fallback.normalizedText)) {
+        seenClaims.push(fallback.normalizedText);
+      }
+    }
+
     if (keptQuotes.length > 0) {
       source.quotes = keptQuotes;
       scoredSourceBriefs.push({
@@ -2060,7 +3053,6 @@ function summarizeSynthesisSources(input: {
         }),
       });
     } else {
-      droppedQuoteCount += source.quotes.length;
       droppedSourceCount += 1;
     }
   }
@@ -2070,6 +3062,7 @@ function summarizeSynthesisSources(input: {
     .slice(0, SYNTHESIS_MAX_SOURCES_FOR_MODEL)
     .map((s) => {
       const { _sourceScore, ...rest } = s;
+      void _sourceScore;
       return rest;
     });
 
@@ -2092,18 +3085,49 @@ function deriveSynthesisTargets(input: {
 }): SynthesisPromptTargets {
   const sourceCount = Math.max(0, input.sourceCount);
   const quoteCount = Math.max(0, input.quoteCount);
-  const minKeyFindings = sourceCount >= 20
-    ? 10
-    : Math.max(SYNTHESIS_REFINEMENT_OUTPUT_TARGET_MIN_SOURCES, Math.min(9, Math.floor(sourceCount * 0.5) + 1));
-  const cappedByQuotes = Math.min(minKeyFindings, Math.max(1, Math.floor(quoteCount / 3)));
-  const adjustedMin = Math.max(3, Math.min(14, cappedByQuotes));
-  const maxKeyFindings = Math.min(14, adjustedMin + 4);
-  const minRecommendations = Math.max(4, Math.min(12, Math.floor(adjustedMin * 0.85)));
+
+  const minKeyFindingsRaw =
+    sourceCount <= 2
+      ? 1
+      : sourceCount <= 4
+        ? 2
+        : sourceCount <= 7
+          ? 3
+          : sourceCount <= 12
+            ? 4
+            : Math.min(10, Math.max(5, Math.floor(sourceCount * 0.5)));
+
+  const minKeyFindings = Math.min(minKeyFindingsRaw, Math.max(1, Math.ceil(quoteCount / 2)));
+  const maxKeyFindings = Math.min(14, Math.max(minKeyFindings, minKeyFindings + 4));
+
+  const minRecommendations =
+    sourceCount <= 2
+      ? 1
+      : sourceCount <= 4
+        ? 1
+        : sourceCount <= 7
+          ? 2
+          : sourceCount <= 12
+            ? 3
+            : Math.min(8, Math.max(4, Math.floor(minKeyFindings * 0.75)));
+
   const maxRecommendations = Math.min(16, minRecommendations + 4);
-  const minSummaryWords = SYNTHESIS_TARGET_MIN_SUMMARY_WORDS;
+
+  const minSummaryWords =
+    sourceCount <= 1
+      ? 2
+      : sourceCount <= 2
+        ? 4
+        : sourceCount <= 4
+          ? 60
+          : sourceCount <= 8
+            ? 120
+            : sourceCount <= 12
+              ? 200
+              : SYNTHESIS_TARGET_MIN_SUMMARY_WORDS;
 
   return {
-    minKeyFindings: adjustedMin,
+    minKeyFindings,
     maxKeyFindings,
     minRecommendations,
     maxRecommendations,
@@ -2118,6 +3142,13 @@ function isSynthesisOutputSufficient(input: {
 }): boolean {
   const recommendations = input.output.recommendations ?? [];
   const summaryWordCount = input.output.summary.split(/\s+/).filter(Boolean).length;
+  const baseSufficient =
+    input.output.keyFindings.length >= input.targets.minKeyFindings &&
+    recommendations.length >= input.targets.minRecommendations &&
+    summaryWordCount >= input.targets.minSummaryWords;
+  if (!baseSufficient) return false;
+  if (input.sourceCount <= 2) return true;
+
   const findingSourceCounts = input.output.keyFindings.map(
     (f) => new Set((f.citations ?? []).map((c) => c.source).filter(Boolean)).size
   );
@@ -2145,28 +3176,26 @@ function isSynthesisOutputSufficient(input: {
     : 0;
   const confidenceAppendixLength = input.output.confidenceAppendix?.length ?? 0;
   const requiredCrossSourceFindings =
-    input.sourceCount <= 1
-      ? 0
-      : Math.max(
+    input.sourceCount >= 4
+      ? Math.max(
           1,
           Math.min(4, Math.min(input.sourceCount, Math.ceil(input.targets.minKeyFindings * 0.35)))
-        );
-  const requiredSourceCoverage = Math.max(
-    2,
-    Math.min(input.sourceCount, Math.ceil(Math.max(3, input.sourceCount) * 0.2))
-  );
+        )
+      : 0;
+  const requiredSourceCoverage =
+    input.sourceCount <= 2
+      ? 1
+      : Math.min(input.sourceCount, Math.max(2, Math.ceil(input.sourceCount * 0.2)));
   const synthesisPressure = crossSourceFindings >= 1;
   const hasCrossSourceDiversity = crossSourceFindings >= requiredCrossSourceFindings;
   const hasBroadSourceCoverage = sourceCoverage >= requiredSourceCoverage;
   const hasAnalyticScaffolding =
-    sourceIndexLength >= SYNTHESIS_MIN_SOURCE_INDEX_ENTRIES &&
-    thematicSynthesisLength >= 1 &&
-    negativeSpace >= 2 &&
-    confidenceAppendixLength >= 1;
+    input.sourceCount < 4 ||
+    (sourceIndexLength >= SYNTHESIS_MIN_SOURCE_INDEX_ENTRIES &&
+      thematicSynthesisLength >= 1 &&
+      negativeSpace >= 1 &&
+      confidenceAppendixLength >= 1);
   return (
-    input.output.keyFindings.length >= input.targets.minKeyFindings &&
-    recommendations.length >= input.targets.minRecommendations &&
-    summaryWordCount >= input.targets.minSummaryWords &&
     hasCrossSourceSynthesis &&
     hasCrossSourceDiversity &&
     hasBroadSourceCoverage &&
@@ -2224,7 +3253,7 @@ function trimSynthesisContextForBudget(input: {
 }): SynthesisContextTrimResult {
   const sourceCountBefore = input.sourceBriefs.length;
   const quoteCountBefore = input.sourceBriefs.reduce((sum, source) => sum + source.quotes.length, 0);
-  let working = cloneSourceBriefs(input.sourceBriefs);
+  const working = cloneSourceBriefs(input.sourceBriefs);
   let workingAbstracts = [...input.sourceAbstracts];
   let workingCriticalSourceContexts = [...input.criticalSourceContexts];
 
@@ -2473,41 +3502,48 @@ async function buildSourceAbstracts(input: {
   criticalSourceContexts: Array<{ source: string; reason: string; excerpt: string }>;
 }> {
   const sourceSubstr = input.sources.map((sourceBrief) => sourceBrief.source);
-  const parsed = await callModelJsonLogged({
-    runId: input.runId,
-    userId: input.userId,
-    phase: "synthesize",
-    provider: input.provider,
-    model: input.model,
-    messages: [
-      {
-        role: "system",
-        content: SYNTHESIS_SOURCE_ABSTRACT_SYSTEM_PROMPT,
-      },
-      {
-        role: "user",
-        content: JSON.stringify(
-          buildSourceAbstractsPayload({
-            prompt: input.prompt,
-            citationPolicy: input.citationPolicy,
-            sourceBriefs: input.sources,
-          })
-        ),
-      },
-    ],
-    schema: SYNTHESIS_SOURCE_ABSTRACTS_OUTPUT_SCHEMA,
-    maxTokens: 2_000,
-    reasoningEffort: input.thinkingMode,
-    store: input.store,
-    objectStore: input.objectStore,
-    checkpoint: input.checkpoint,
-    promptVersion: "synthesize.source-abstracts.v1",
-  });
+  let parsed: z.infer<typeof SYNTHESIS_SOURCE_ABSTRACTS_OUTPUT_SCHEMA> | null = null;
+  let fallbackError: { name: string; message: string } | null = null;
+  try {
+    parsed = await callModelJsonLogged({
+      runId: input.runId,
+      userId: input.userId,
+      phase: "synthesize",
+      persona: "synthesis-source-compression",
+      synthesisPurpose: "source-abstracts",
+      provider: input.provider,
+      model: input.model,
+      messages: [
+        {
+          role: "system",
+          content: SYNTHESIS_SOURCE_ABSTRACT_SYSTEM_PROMPT,
+        },
+        {
+          role: "user",
+          content: JSON.stringify(
+            buildSourceAbstractsPayload({
+              prompt: input.prompt,
+              citationPolicy: input.citationPolicy,
+              sourceBriefs: input.sources,
+            })
+          ),
+        },
+      ],
+      schema: SYNTHESIS_SOURCE_ABSTRACTS_OUTPUT_SCHEMA,
+      maxTokens: 2_000,
+      reasoningEffort: input.thinkingMode,
+      store: input.store,
+      objectStore: input.objectStore,
+      checkpoint: input.checkpoint,
+      promptVersion: "synthesize.source-abstracts.v1",
+    });
+  } catch (error) {
+    fallbackError =
+      error instanceof Error ? { name: error.name, message: error.message } : { name: "UnknownError", message: String(error) };
+  }
 
   const bySource = new Map<string, SynthesisSourceAbstract>();
-  const normalizedAbstracts = (parsed.sourceAbstracts ?? []).map((abstract) =>
-    normalizeSourceAbstract(abstract)
-  );
+  const normalizedAbstracts = (parsed?.sourceAbstracts ?? []).map((abstract) => normalizeSourceAbstract(abstract));
   for (const abstract of normalizedAbstracts) {
     bySource.set(abstract.source, abstract);
   }
@@ -2519,19 +3555,37 @@ async function buildSourceAbstracts(input: {
     .filter(Boolean)
     .slice(0, input.requestedSourceLimit);
 
-  await input.store
-    .addRunEvent({
-      runId: input.runId,
-      level: "info",
-      phase: "synthesize",
-      eventType: "synthesis_source_abstracts_created",
-      message: "Source abstracts generated for synthesis compression step",
-      data: {
-        requestedAbstracts: input.sources.length,
-        producedAbstracts: sourceAbstracts.length,
-      },
-    })
-    .catch(() => {});
+  if (fallbackError) {
+    await input.store
+      .addRunEvent({
+        runId: input.runId,
+        level: "warn",
+        phase: "synthesize",
+        eventType: "synthesis_source_abstracts_fallback",
+        message: "Source abstract generation failed; using deterministic fallback summaries",
+        data: {
+          requestedAbstracts: input.sources.length,
+          producedAbstracts: sourceAbstracts.length,
+          errorName: fallbackError.name,
+          errorMessage: fallbackError.message,
+        },
+      })
+      .catch(() => {});
+  } else {
+    await input.store
+      .addRunEvent({
+        runId: input.runId,
+        level: "info",
+        phase: "synthesize",
+        eventType: "synthesis_source_abstracts_created",
+        message: "Source abstracts generated for synthesis compression step",
+        data: {
+          requestedAbstracts: input.sources.length,
+          producedAbstracts: sourceAbstracts.length,
+        },
+      })
+      .catch(() => {});
+  }
 
   return {
     sourceAbstracts,
@@ -2554,7 +3608,7 @@ async function reviewSynthesisDraft(input: {
   store: PipelineStore;
   objectStore: ObjectStore;
   checkpoint: RunCheckpoint;
-}): Promise<SynthesisReviewOutput | undefined> {
+}): Promise<SynthesisReviewOutput> {
   const summaryOfOutput = {
     summary: input.synthesis.summary,
     keyFindings: input.synthesis.keyFindings.map((item) => ({
@@ -2566,68 +3620,66 @@ async function reviewSynthesisDraft(input: {
     unknowns: input.synthesis.unknowns,
   };
 
-  try {
-    const sourceAbstractBySource = new Map<string, SynthesisSourceAbstract>();
-    for (const abstract of input.sourceAbstracts ?? []) {
-      sourceAbstractBySource.set(abstract.source, normalizeSourceAbstract(abstract));
-    }
+  const sourceAbstractBySource = new Map<string, SynthesisSourceAbstract>();
+  for (const abstract of input.sourceAbstracts ?? []) {
+    sourceAbstractBySource.set(abstract.source, normalizeSourceAbstract(abstract));
+  }
 
-    const review = await callModelJsonLogged({
+  const review = await callModelJsonLogged({
       runId: input.runId,
       userId: input.userId,
       phase: "synthesize",
+      persona: "synthesis-review",
+      synthesisPurpose: "review",
       provider: input.provider,
-      model: input.model,
+    model: input.model,
       messages: [
         {
           role: "system",
-          content: SYNTHESIS_SYSTEM_REVIEW_PROMPT,
+          content: SYNTHESIS_SYSTEM_REVIEW_PROMPT_WITH_SCHEMA,
         },
-        {
-          role: "user",
-          content: JSON.stringify({
-            prompt: input.prompt,
-            sources: input.sources.map((s) => {
-              const sourceAbstract = sourceAbstractBySource.get(s.source);
-              return {
-                source: s.source,
-                sampleClaims: s.quotes.slice(0, 3),
-                abstract: sourceAbstract
-                  ? {
-                      methodology: sourceAbstract.methodology,
-                      temporalContext: sourceAbstract.temporalContext,
-                      dataTypes: sourceAbstract.dataTypes,
-                      stakeholderPosition: sourceAbstract.stakeholderPosition,
-                      representativeClaims: sourceAbstract.representativeClaims,
-                      keyConstraints: sourceAbstract.keyConstraints,
-                    }
-                  : undefined,
-              };
-            }),
-            draft: summaryOfOutput,
-            reviewRequest:
-              "Attack the report sentence-by-sentence: mark conclusions that exceed source evidence, point out missing evidence, and return concrete revisions.",
+      {
+        role: "user",
+        content: JSON.stringify({
+          prompt: input.prompt,
+          sources: input.sources.map((s) => {
+            const sourceAbstract = sourceAbstractBySource.get(s.source);
+            return {
+              source: s.source,
+              sampleClaims: s.quotes.slice(0, 3),
+              abstract: sourceAbstract
+                ? {
+                    methodology: sourceAbstract.methodology,
+                    temporalContext: sourceAbstract.temporalContext,
+                    dataTypes: sourceAbstract.dataTypes,
+                    stakeholderPosition: sourceAbstract.stakeholderPosition,
+                    representativeClaims: sourceAbstract.representativeClaims,
+                    keyConstraints: sourceAbstract.keyConstraints,
+                  }
+                : undefined,
+            };
           }),
-        },
-      ],
-      schema: SYNTHESIS_REVIEW_SCHEMA,
-      maxTokens: 5_000,
-      reasoningEffort: input.thinkingMode,
-      store: input.store,
-      objectStore: input.objectStore,
-      checkpoint: input.checkpoint,
-      promptVersion: "synthesize.review.v1",
-    });
-    return {
-      verdict: review.verdict,
-      unsupportedConclusions: review.unsupportedConclusions ?? [],
-      missingEvidence: review.missingEvidence ?? [],
-      requestedRevisions: review.requestedRevisions ?? [],
-      confidenceRisk: review.confidenceRisk,
-    };
-  } catch {
-    return undefined;
-  }
+          draft: summaryOfOutput,
+          reviewRequest:
+            "Attack the report sentence-by-sentence: mark conclusions that exceed source evidence, point out missing evidence, and return concrete revisions.",
+        }),
+      },
+    ],
+    schema: SYNTHESIS_REVIEW_SCHEMA,
+    maxTokens: 5_000,
+    reasoningEffort: input.thinkingMode,
+    store: input.store,
+    objectStore: input.objectStore,
+    checkpoint: input.checkpoint,
+    promptVersion: "synthesize.review.v1",
+  });
+  return {
+    verdict: review.verdict,
+    unsupportedConclusions: review.unsupportedConclusions ?? [],
+    missingEvidence: review.missingEvidence ?? [],
+    requestedRevisions: review.requestedRevisions ?? [],
+    confidenceRisk: review.confidenceRisk,
+  };
 }
 
 async function synthesizePhase(input: {
@@ -2647,6 +3699,8 @@ async function synthesizePhase(input: {
   store: PipelineStore;
   objectStore: ObjectStore;
   checkpoint: RunCheckpoint;
+  previousSynthesis?: SynthesisOutput;
+  reviewPolicy?: "enforce" | "skip";
 }): Promise<SynthesisOutput> {
   if (!input.provider) {
     const findings = input.sources.slice(0, 5).map((s, i) => {
@@ -2706,47 +3760,47 @@ async function synthesizePhase(input: {
   const sourceCountCap = preTrim.sourceCountAfter;
   const quoteCountCap = preTrim.quoteCountAfter;
   const shouldRunAbstractPass =
-    sourceCountCap > SYNTHESIS_SOURCE_ABSTRACT_TRIGGER_SOURCE_COUNT ||
-    estimateTokenCountFromJson(
-      buildSynthesisPromptPayload({
-        prompt: input.prompt,
-        citationPolicy: input.citationPolicy,
-        sources: preTrim.sourceBriefs,
-        targets,
-      })
-    ) >
-      Math.max(SYNTHESIS_MIN_QUOTE_TEXT_LENGTH, input.maxInputTokens * 0.9);
-  const reviewEnabled = sourceCountCap >= SYNTHESIS_MIN_REVIEW_SOURCE_COUNT;
+    sourceCountCap >= 2 &&
+    (sourceCountCap > SYNTHESIS_SOURCE_ABSTRACT_TRIGGER_SOURCE_COUNT ||
+      estimateTokenCountFromJson(
+        buildSynthesisPromptPayload({
+          prompt: input.prompt,
+          citationPolicy: input.citationPolicy,
+          sources: preTrim.sourceBriefs,
+          targets,
+        })
+      ) >
+        Math.max(SYNTHESIS_MIN_QUOTE_TEXT_LENGTH, input.maxInputTokens * 0.9));
+  const reviewEnabled =
+    input.reviewPolicy !== "skip" && sourceCountCap >= SYNTHESIS_MIN_REVIEW_SOURCE_COUNT;
   let sourceAbstracts: SynthesisSourceAbstract[] = [];
-  let criticalSourceContexts: Array<{ source: string; reason: string; excerpt: string }> = [];
+  let criticalSourceContexts: Array<{ source: string; reason: string; excerpt: string }> =
+    selectCriticalSourceContexts({ sourceBriefs: preTrim.sourceBriefs });
 
   if (shouldRunAbstractPass) {
-    try {
-      const abstractPack = await buildSourceAbstracts({
-        runId: input.runId,
-        userId: input.userId,
-        prompt: input.prompt,
-        sources: preTrim.sourceBriefs,
-        citationPolicy: input.citationPolicy,
-        provider: input.provider,
-        model: input.model,
-        thinkingMode: input.thinkingMode,
-        store: input.store,
-        objectStore: input.objectStore,
-        checkpoint: input.checkpoint,
-        requestedSourceLimit: Math.min(SYNTHESIS_MAX_SOURCE_ABSTRACTS, sourceCountCap),
-      });
-      sourceAbstracts = abstractPack.sourceAbstracts;
-      criticalSourceContexts = abstractPack.criticalSourceContexts;
-    } catch {
-      sourceAbstracts = preTrim.sourceBriefs.map((source) => buildSourceAbstractFallback(source));
-      criticalSourceContexts = selectCriticalSourceContexts({ sourceBriefs: preTrim.sourceBriefs });
-    }
+    const abstractPack = await buildSourceAbstracts({
+      runId: input.runId,
+      userId: input.userId,
+      prompt: input.prompt,
+      sources: preTrim.sourceBriefs,
+      citationPolicy: input.citationPolicy,
+      provider: input.provider,
+      model: input.model,
+      thinkingMode: input.thinkingMode,
+      store: input.store,
+      objectStore: input.objectStore,
+      checkpoint: input.checkpoint,
+      requestedSourceLimit: Math.min(SYNTHESIS_MAX_SOURCE_ABSTRACTS, sourceCountCap),
+    });
+    sourceAbstracts = abstractPack.sourceAbstracts;
+    criticalSourceContexts = abstractPack.criticalSourceContexts;
   }
-  let previousSynthesis: SynthesisOutput | undefined;
+  let previousSynthesis: SynthesisOutput | undefined = input.previousSynthesis;
   let lastTrimResult: SynthesisContextTrimResult | undefined;
   let reviewDirectives: string[] = [];
   let reviewFeedback: SynthesisReviewFeedbackPayload | undefined;
+  let lastReviewVerdict: SynthesisReviewOutput["verdict"] | null = null;
+  let lastOutput: SynthesisOutput | undefined;
 
   const logOutputCapEvent = async (
     trimResult: SynthesisContextTrimResult,
@@ -2815,7 +3869,7 @@ async function synthesizePhase(input: {
     }
   };
 
-  const attempts = SYNTHESIS_REFINEMENT_ATTEMPTS + 1;
+  const attempts = SYNTHESIS_REFINEMENT_ATTEMPTS;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const trimResult = trimSynthesisContextForBudget({
       maxInputTokens: input.maxInputTokens,
@@ -2866,6 +3920,8 @@ async function synthesizePhase(input: {
       runId: input.runId,
       userId: input.userId,
       phase: "synthesize",
+      persona: "synthesis-writing",
+      synthesisPurpose: "writing",
       provider: input.provider,
       model: input.model,
       messages: [sys, user],
@@ -2907,6 +3963,7 @@ async function synthesizePhase(input: {
           }))
         : undefined,
     };
+    lastOutput = out;
 
     const reviewIfNeeded = async () => {
       if (!reviewEnabled || !input.provider) return true;
@@ -2924,10 +3981,10 @@ async function synthesizePhase(input: {
         objectStore: input.objectStore,
         checkpoint: input.checkpoint,
       });
-      if (!review) return true;
       const unsupportedConclusions = review.unsupportedConclusions ?? [];
       const requestedRevisions = review.requestedRevisions ?? [];
       const missingEvidence = review.missingEvidence ?? [];
+      lastReviewVerdict = review.verdict;
 
       await input.store
         .addRunEvent({
@@ -3064,7 +4121,10 @@ async function synthesizePhase(input: {
       level: "warn",
       phase: "synthesize",
       eventType: "synthesis_refinement_exhausted",
-      message: "Synthesis refinement loop exhausted; using best-effort output",
+      message:
+        reviewEnabled && lastReviewVerdict && lastReviewVerdict !== "accept"
+          ? "Synthesis refinement loop exhausted; failing synthesis phase"
+          : "Synthesis refinement loop exhausted; returning best-effort synthesis",
       data: {
         attemptsUsed: attempts,
         targetSummaryWords: targets.minSummaryWords,
@@ -3072,6 +4132,7 @@ async function synthesizePhase(input: {
         targetRecommendations: targets.minRecommendations,
         sourceCountCap,
         quoteCountCap,
+        lastReviewVerdict,
         lastTrim: lastTrimResult
           ? {
               inputTokensAfter: lastTrimResult.inputTokensAfter,
@@ -3085,17 +4146,11 @@ async function synthesizePhase(input: {
     })
     .catch(() => {});
 
-  return {
-    summary: previousSynthesis?.summary ?? "Best-effort synthesis from available sources.",
-    keyFindings:
-      previousSynthesis?.keyFindings ?? [
-        { id: "F1", text: "Unable to synthesize a full evidence memo.", citations: [] },
-      ],
-    contradictions: previousSynthesis?.contradictions ?? [],
-    recommendations: previousSynthesis?.recommendations ?? [],
-    unknowns: [
-      ...(previousSynthesis?.unknowns ?? []),
-      "Could not produce output to requested synthesis depth after refinement loop.",
-    ],
-  };
+  if (reviewEnabled && lastReviewVerdict && lastReviewVerdict !== "accept") {
+    throw new Error("Synthesis could not reach requested depth after refinement loop.");
+  }
+
+  if (lastOutput) return lastOutput;
+
+  throw new Error("Synthesis refinement exhausted without producing output.");
 }

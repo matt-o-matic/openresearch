@@ -1,0 +1,451 @@
+{
+  "version": 1,
+  "featureSlug": "research-loop-enhancement",
+  "updatedAt": "2026-02-16T14:39:07.120Z",
+  "rounds": [
+    {
+      "id": "round-1",
+      "title": "Round 1",
+      "questions": [
+        {
+          "id": "r1-q1",
+          "prompt": "How should the iterative research loop be enabled by default?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Enabled by default for all runs (behavior change)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Disabled by default; enable via config (quality profile/adapter config)",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Disabled by default; enable via per-run CLI/API flag only",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Enabled only when heuristics detect a multi-step dependency prompt",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:37:05.606Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q2",
+          "prompt": "What should be the primary stop criteria for the loop?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Fixed iterations only (e.g., always 3)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Stop when an iteration finds no net-new sources",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Composite: gap-analysis stop OR diminishing returns OR budgets OR iteration cap",
+              "recommended": true
+            },
+            {
+              "key": "D",
+              "text": "Stop when verifier coverage reaches a configured threshold",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Stop only when runtime budget is exhausted",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "C",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:37:07.671Z",
+              "selectedKey": "C",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q3",
+          "prompt": "How should the system decide what to research next each iteration?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Use synthesis unknowns/negative space only",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Use verifier coverage/issues only (no additional model call)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Dedicated gap-analysis model call: reads plan + synthesis + verification and outputs next steps (JSON)",
+              "recommended": true
+            },
+            {
+              "key": "D",
+              "text": "Heuristic broadening of original queries (no reflection step)",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Human-in-the-loop approval between iterations",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "C",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:38:18.262Z",
+              "selectedKey": "C",
+              "notes": "use planner model for this.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q4",
+          "prompt": "What synthesis strategy should we use across iterations?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Re-synthesize from scratch each iteration using all evidence (simplest, costlier)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Incrementally refine prior synthesis using only new sources (cheaper, drift risk)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Hybrid: lightweight interim synthesis each iteration + one full synthesis at the end",
+              "recommended": true
+            },
+            {
+              "key": "D",
+              "text": "No interim synthesis; synthesize only once at the end",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "C",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:40:45.527Z",
+              "selectedKey": "C",
+              "notes": "let's implement two modes.. B and C. Only use C when reviewer pass is finding critical issues 2x iterations. (use verifier/verifierStrong for review passes)",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q5",
+          "prompt": "How should per-iteration retrieval be budgeted?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Fixed small batch (e.g., 3 queries, 5 sources) for every iteration",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Scale batch size by remaining global budget (more early, fewer later)",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Use global budgets in first iteration only (current behavior)",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Per-iteration cap + global cap (sourcesPerIteration + maxSources)",
+              "recommended": true
+            },
+            {
+              "key": "E",
+              "text": "Require per-run user settings; no defaults",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "D",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:41:56.506Z",
+              "selectedKey": "D",
+              "notes": "keep globals the same, per iteration should be 1/5 of the global or 20 sources whichever is greater.",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q6",
+          "prompt": "What intermediate artifacts should be persisted and exposed?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Persist all iteration artifacts and expose them by default",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Persist all iteration artifacts; expose only final output unless debug/advanced",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Persist only the latest iteration (overwrite) to save space",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Persist minimal artifacts (gap analysis + final memo only)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:42:29.973Z",
+              "selectedKey": "B",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q7",
+          "prompt": "How should the plan be updated over time during the loop?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Overwrite a single mutable plan artifact each iteration",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Keep the original plan immutable and add plan versions per iteration (history)",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Maintain a separate live plan artifact; keep original plan unchanged",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Do not update the plan; only generate next queries",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Store plan changes only as run events (no plan artifacts)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:43:11.539Z",
+              "selectedKey": "B",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r1-q8",
+          "prompt": "Where should the loop logic live to keep the codebase testable and maintainable?",
+          "options": [
+            {
+              "key": "A",
+              "text": "All in packages/core orchestrator (single file)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Extract loop planner to a new module in packages/core; orchestrator wires it",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Put the loop in apps/worker; keep core single-pass",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Implement as API-driven sequencing in apps/api (core unchanged)",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T13:43:41.261Z",
+              "selectedKey": "B",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-2",
+      "title": "Round 2",
+      "questions": [
+        {
+          "id": "r2-q1",
+          "prompt": "For auto-switching from Mode B (incremental) to Mode C (hybrid), what should count as a critical reviewer issue and how should the ‘2x iterations’ rule be applied?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Critical = reviewer verdict reject; switch after 2 rejects (not necessarily consecutive)",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Critical = reviewer verdict reject; switch after 2 consecutive rejects",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Critical = reject OR (revise with unsupportedConclusions>0); switch after 2 consecutive critical iterations",
+              "recommended": true
+            },
+            {
+              "key": "D",
+              "text": "Critical = any verdict other than accept; switch after 2 consecutive non-accept iterations",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "No auto-switch; mode is fixed per run via config",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "C",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T14:34:03.723Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q2",
+          "prompt": "How should verifier vs verifierStrong be used for synthesis review passes?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Always use models.verifier for review",
+              "recommended": false
+            },
+            {
+              "key": "B",
+              "text": "Use models.verifier; if verdict != accept, re-run once with models.verifierStrong and treat that verdict as authoritative",
+              "recommended": true
+            },
+            {
+              "key": "C",
+              "text": "Always use models.verifierStrong for review",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Use models.verifier during iterations; use models.verifierStrong only for the final full synthesis review",
+              "recommended": false
+            },
+            {
+              "key": "E",
+              "text": "Disable model-based review; rely on deterministic citation validation only",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "B",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T14:34:23.885Z",
+              "selectedKey": "D",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        },
+        {
+          "id": "r2-q3",
+          "prompt": "When Mode C (hybrid) is activated mid-run, should the system stay in Mode C for the rest of the run?",
+          "options": [
+            {
+              "key": "A",
+              "text": "Yes—once switched, stay hybrid until finalize",
+              "recommended": true
+            },
+            {
+              "key": "B",
+              "text": "Switch to hybrid for one iteration only, then try incremental again",
+              "recommended": false
+            },
+            {
+              "key": "C",
+              "text": "Switch to hybrid; revert back to incremental after 2 consecutive accept reviews",
+              "recommended": false
+            },
+            {
+              "key": "D",
+              "text": "Never switch automatically; mode is fixed per run",
+              "recommended": false
+            }
+          ],
+          "recommendedKey": "A",
+          "answers": [
+            {
+              "id": "rev-1",
+              "createdAt": "2026-02-16T14:34:53.003Z",
+              "selectedKey": "A",
+              "notes": "",
+              "attachments": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "round-3",
+      "title": "Round 3 (complete)",
+      "questions": []
+    }
+  ],
+  "notes": ""
+}

@@ -89,6 +89,12 @@ describe("loadConfig", () => {
         maxInputTokens: 1_000_000,
         maxOutputTokens: 500_000,
       });
+      expect(config.policies.qualityProfiles.full.researchLoop).toMatchObject({
+        enabled: true,
+        maxIterations: 5,
+        mode: "auto",
+        switchToHybridAfterRejects: 2,
+      });
       expect(config.policies.qualityProfiles.degraded.agenticLoop).toMatchObject({
         maxPlanPasses: 5,
         maxFollowUpTasksPerPass: 10,
@@ -96,6 +102,12 @@ describe("loadConfig", () => {
       expect(config.policies.qualityProfiles.degraded.synthesis).toMatchObject({
         maxInputTokens: 1_000_000,
         maxOutputTokens: 500_000,
+      });
+      expect(config.policies.qualityProfiles.degraded.researchLoop).toMatchObject({
+        enabled: true,
+        maxIterations: 5,
+        mode: "auto",
+        switchToHybridAfterRejects: 2,
       });
     } finally {
       await fs.rm(dir, { recursive: true, force: true });

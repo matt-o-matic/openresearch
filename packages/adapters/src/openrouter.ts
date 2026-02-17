@@ -22,6 +22,8 @@ export class OpenRouterModelProvider implements ModelProvider {
   private readonly appName: string;
   private readonly appUrl: string | undefined;
 
+  static readonly EMPTY_RESPONSE_MARKER = "EMPTY_MODEL_RESPONSE";
+
   constructor(opts: { apiKey: string; baseUrl?: string; appName?: string; appUrl?: string }) {
     this.apiKey = opts.apiKey;
     this.baseUrl = opts.baseUrl ?? "https://openrouter.ai/api/v1";
@@ -53,8 +55,12 @@ export class OpenRouterModelProvider implements ModelProvider {
       throw new Error(msg);
     }
 
-    const text = json.choices?.[0]?.message?.content ?? "";
-    if (!text) throw new Error("OpenRouter: empty response");
+    const text = typeof json.choices?.[0]?.message?.content === "string"
+      ? json.choices[0].message.content
+      : "";
+    if (!text.trim()) {
+      throw new Error(`${OpenRouterModelProvider.EMPTY_RESPONSE_MARKER}: Empty model response`);
+    }
 
     let usage: ChatCompletionResponse["usage"] | undefined;
     if (json.usage) {

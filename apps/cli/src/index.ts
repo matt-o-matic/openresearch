@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { format } from "node:util";
 
 import {
   loadConfig,
@@ -116,7 +117,7 @@ type DbRunEvent = {
   phase: string | null;
   event_type: string;
   message: string | null;
-  data: Record<string, unknown> | null;
+  data: unknown;
 };
 
 type DbRun = {
@@ -148,6 +149,44 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function runLogKey(runId: string): string {
+  return `runs/${runId}/run.log`;
+}
+
+type CliLog = (...parts: unknown[]) => void;
+
+type RunLogWriter = {
+  log: CliLog;
+  write: (text: string) => void;
+  flush: () => Promise<void>;
+};
+
+function createRunLogWriter({
+  runId,
+  objectStore,
+}: {
+  runId: string;
+  objectStore: FilesystemObjectStore;
+}): RunLogWriter {
+  const chunks: string[] = [];
+  const writeChunk = (chunk: string) => {
+    if (!chunk) return;
+    process.stdout.write(chunk);
+    chunks.push(chunk);
+  };
+  const log: CliLog = (...parts) => {
+    const message = `${format(...parts)}\n`;
+    writeChunk(message);
+  };
+  return {
+    log,
+    write: writeChunk,
+    flush: async () => {
+      await objectStore.putText(runLogKey(runId), chunks.join(""));
+    },
+  };
+}
+
 function formatElapsed(startedAt: number): string {
   const totalMs = Math.max(0, Date.now() - startedAt);
   const totalSec = Math.floor(totalMs / 1000);
@@ -158,6 +197,11 @@ function formatElapsed(startedAt: number): string {
 
 function safeString(value: unknown): string {
   return typeof value === "string" ? value : "unknown";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 }
 
 function formatDurationMs(ms: number): string {
@@ -201,7 +245,10 @@ function formatTodoItems(rawItems: unknown): CliTodoItem[] {
         const asObject = item as { text?: unknown; index?: unknown };
         if (typeof asObject.text === "string") {
           const normalized = asObject.text.trim();
-          const indexValue = typeof asObject.index === "number" && Number.isFinite(asObject.index) ? asObject.index : defaultIndex + 1;
+          const indexValue =
+            typeof asObject.index === "number" && Number.isFinite(asObject.index)
+              ? asObject.index
+              : defaultIndex + 1;
           if (normalized) return { index: indexValue, text: normalized };
         }
       }
@@ -217,9 +264,7 @@ function formatTodoHints(rawHints: unknown): string[] {
     .filter((value): value is string => Boolean(value));
 }
 
-function formatReviewUnsupportedConclusions(
-  rawConclusions: unknown
-): Array<{
+function formatReviewUnsupportedConclusions(rawConclusions: unknown): Array<{
   findingId: string;
   issue: string;
   why: string;
@@ -239,12 +284,16 @@ function formatReviewUnsupportedConclusions(
       const issue = typeof source.issue === "string" ? source.issue.trim() : "";
       const why = typeof source.why === "string" ? source.why.trim() : "";
       const strengtheningAlternative =
-        typeof source.strengtheningAlternative === "string" ? source.strengtheningAlternative.trim() : "";
+        typeof source.strengtheningAlternative === "string"
+          ? source.strengtheningAlternative.trim()
+          : "";
       if (!findingId || !issue || !why || !strengtheningAlternative) return null;
       return { findingId, issue, why, strengtheningAlternative };
     })
     .filter(
-      (value): value is {
+      (
+        value
+      ): value is {
         findingId: string;
         issue: string;
         why: string;
@@ -261,10 +310,11 @@ function formatStringList(rawValues: unknown): string[] {
 }
 
 function eventLabel(event: DbRunEvent): string {
+  const data = asRecord(event.data);
   if (event.event_type === "plan_todo_list_ready") {
     const message = event.message ?? "Plan to-do list generated";
-    const items = formatTodoItems(event.data?.items);
-    const hints = formatTodoHints(event.data?.queryHints);
+    const items = formatTodoItems(data?.items);
+    const hints = formatTodoHints(data?.queryHints);
     if (items.length === 0) {
       return message;
     }
@@ -275,17 +325,19 @@ function eventLabel(event: DbRunEvent): string {
     return lines.join("\n");
   }
   if (event.event_type === "synthesis_review_feedback") {
-    const data = event.data && typeof event.data === "object" ? event.data : {};
-    const verdict = typeof data.verdict === "string" ? data.verdict : "unknown";
+    const verdictRaw = data?.verdict;
+    const verdict = typeof verdictRaw === "string" ? verdictRaw : "unknown";
+    const attemptRaw = data?.attempt;
     const attempt =
-      typeof data.attempt === "number" && Number.isFinite(data.attempt) ? data.attempt : undefined;
+      typeof attemptRaw === "number" && Number.isFinite(attemptRaw) ? attemptRaw : undefined;
+    const confidenceRiskRaw = data?.confidenceRisk;
     const confidenceRisk =
-      typeof data.confidenceRisk === "number" && Number.isFinite(data.confidenceRisk)
-        ? data.confidenceRisk
+      typeof confidenceRiskRaw === "number" && Number.isFinite(confidenceRiskRaw)
+        ? confidenceRiskRaw
         : undefined;
-    const unsupported = formatReviewUnsupportedConclusions(data.unsupportedConclusions);
-    const missingEvidence = formatStringList(data.missingEvidence);
-    const revisions = formatStringList(data.requestedRevisions);
+    const unsupported = formatReviewUnsupportedConclusions(data?.unsupportedConclusions);
+    const missingEvidence = formatStringList(data?.missingEvidence);
+    const revisions = formatStringList(data?.requestedRevisions);
     const lines = [
       `Reviewer feedback received${attempt ? ` (attempt ${attempt})` : ""}: ${verdict}`,
     ];
@@ -324,26 +376,81 @@ function eventLabel(event: DbRunEvent): string {
     return lines.join("\n");
   }
 
+  if (event.event_type === "model_call_started") {
+    const reason =
+      (data?.reasoningEffort as string) ??
+      (data?.reasoning_effort as string) ??
+      "unknown";
+    const modelCallId = safeString(data?.modelCallId);
+    const persona = safeString(data?.persona ?? data?.phase);
+    const purpose = safeString(data?.synthesisPurpose);
+    const maxTokens = normalizeCount(data?.maxTokens);
+    const maxRetries = Number(data?.maxRetries);
+    const retryPolicy =
+      Number.isFinite(maxRetries) && maxRetries >= 0 ? ` maxRetries=${maxRetries}` : "";
+    return `Model call started: persona=${persona} id=${modelCallId} purpose=${purpose || "n/a"} model=${safeString(data?.model)} reasoning=${safeString(reason)} maxTokens=${String(
+        maxTokens || "unknown"
+    )} ${retryPolicy}`;
+  }
+  if (event.event_type === "model_call_retry") {
+    const reason = safeString(data?.errorMessage);
+    const modelCallId = safeString(data?.modelCallId);
+    const reasoning =
+      (data?.reasoningEffort as string) ??
+      (data?.reasoning_effort as string) ??
+      "unknown";
+    const attempt = normalizeCount(data?.retryAttempt);
+    const displayAttempt = attempt + 1;
+    const maxTokens = normalizeCount(data?.maxTokens);
+    const maxAttempts = Number(data?.maxAttempts);
+    const persona = safeString(data?.persona ?? data?.phase);
+    const model = safeString(data?.model);
+    const attemptLabel = `attempt=${displayAttempt}`;
+    const totalLabel = Number.isFinite(maxAttempts)
+      ? `/${Math.max(1, Math.floor(maxAttempts - 1))}`
+      : "";
+    return `Retrying model call: persona=${persona} id=${modelCallId} purpose=${safeString(data?.synthesisPurpose) || "n/a"} model=${model} reasoning=${safeString(
+      reasoning
+    )} maxTokens=${String(maxTokens || "unknown")} (${attemptLabel}${totalLabel}) reason=${reason}`;
+  }
+  if (event.event_type === "model_call_completed") {
+    const persona = safeString(data?.persona ?? data?.phase);
+    const purpose = safeString(data?.synthesisPurpose);
+    const modelCallId = safeString(data?.modelCallId);
+    const reasoning =
+      (data?.reasoningEffort as string) ??
+      (data?.reasoning_effort as string) ??
+      "unknown";
+    const retryAttempt = normalizeCount(data?.retryAttempt);
+    const maxTokens = normalizeCount(data?.maxTokens);
+    const attemptLabel = ` attempt=${retryAttempt}`;
+    const compat = safeString(data?.schemaCompatMode);
+    const base = `Model call completed: persona=${persona} id=${modelCallId} purpose=${purpose || "n/a"} model=${safeString(
+      data?.model
+    )} reasoning=${safeString(reasoning)} maxTokens=${String(maxTokens || "unknown")} ${attemptLabel}`;
+    return compat && compat !== "unknown" ? `${base} compat=${compat}` : base;
+  }
   if (event.message) return event.message;
+
   switch (event.event_type) {
     case "search_result_candidate":
-      return `Candidate source: ${safeString(event.data?.url)}`;
+      return `Candidate source: ${safeString(data?.url)}`;
     case "source_fetch_started":
-      return `Fetching source: ${safeString(event.data?.url)}`;
+      return `Fetching source: ${safeString(data?.url)}`;
     case "source_fetch_completed":
-      return `Fetched source: ${safeString(event.data?.url)}`;
+      return `Fetched source: ${safeString(data?.url)}`;
     case "source_fetch_failed":
-      return `Fetch failed: ${safeString(event.data?.url)}`;
+      return `Fetch failed: ${safeString(data?.url)}`;
     case "source_extract_started":
-      return `Extracting source: ${safeString(event.data?.url)}`;
+      return `Extracting source: ${safeString(data?.url)}`;
     case "source_extract_completed":
-      return `Extracted source: ${safeString(event.data?.url)}`;
+      return `Extracted source: ${safeString(data?.url)}`;
     case "source_extract_failed":
-      return `Extraction failed: ${safeString(event.data?.url)}`;
+      return `Extraction failed: ${safeString(data?.url)}`;
     case "search_query_started":
-      return `Searching web for: ${safeString(event.data?.query)}`;
+      return `Searching web for: ${safeString(data?.query)}`;
     case "search_query_completed":
-      return `Search complete for: ${safeString(event.data?.query)}`;
+      return `Search complete for: ${safeString(data?.query)}`;
     case "phase_started":
       return `Phase started: ${event.phase ?? "unknown"}`;
     case "phase_completed":
@@ -354,7 +461,7 @@ function eventLabel(event: DbRunEvent): string {
 }
 
 function summarizeSources(sources: DbSource[]): string {
-  const counts: Record<string, number> = {
+  const counts: Record<DbSource["status"], number> = {
     pending: 0,
     fetched: 0,
     rendered: 0,
@@ -363,7 +470,7 @@ function summarizeSources(sources: DbSource[]): string {
     skipped: 0,
   };
   for (const source of sources) {
-    if (counts[source.status] !== undefined) counts[source.status]++;
+    counts[source.status] += 1;
   }
   return `pending=${counts.pending} fetched=${counts.fetched} rendered=${counts.rendered} extracted=${counts.extracted} failed=${counts.failed} skipped=${counts.skipped}`;
 }
@@ -392,7 +499,7 @@ function collectRunFinalStats(input: {
 }) {
   const status = input.run.status;
   const totalSources = input.sources.length;
-  const sourceStatusCounts: Record<string, number> = {
+  const sourceStatusCounts: Record<DbSource["status"], number> = {
     pending: 0,
     fetched: 0,
     rendered: 0,
@@ -401,7 +508,7 @@ function collectRunFinalStats(input: {
     skipped: 0,
   };
   for (const source of input.sources) {
-    if (sourceStatusCounts[source.status] !== undefined) sourceStatusCounts[source.status] += 1;
+    sourceStatusCounts[source.status] += 1;
   }
 
   const eventTypeCounts: Record<string, number> = {};
@@ -429,19 +536,23 @@ function collectRunFinalStats(input: {
     if (event.level === "error") errorEvents += 1;
     if (event.level === "warn") warningEvents += 1;
 
-    if (event.event_type === "search_query_started" || event.event_type === "search_query_completed") {
+    const data = asRecord(event.data);
+    if (
+      event.event_type === "search_query_started" ||
+      event.event_type === "search_query_completed"
+    ) {
       searchQueries += 1;
     }
     if (event.event_type === "search_query_completed") {
-      searchQueryResultCount += normalizeCount(event.data?.results);
+      searchQueryResultCount += normalizeCount(data?.results);
     }
     if (event.event_type === "search_result_candidate") {
-      const url = normalizeText(event.data?.url);
+      const url = normalizeText(data?.url);
       if (url) discoveredUrls.add(url);
     }
 
     if (event.event_type === "plan_pass_started" || event.event_type === "plan_pass_completed") {
-      const pass = normalizeCount(event.data?.pass);
+      const pass = normalizeCount(data?.pass);
       if (pass > planPasses) planPasses = pass;
     }
     if (event.event_type === "plan_pass_completed") {
@@ -452,14 +563,14 @@ function collectRunFinalStats(input: {
     }
     if (event.event_type === "plan_continue_requested") {
       planContinueRequests += 1;
-      const pass = normalizeCount(event.data?.pass);
+      const pass = normalizeCount(data?.pass);
       if (pass > planPasses) planPasses = pass;
     }
     if (event.event_type === "plan_loop_cap_reached") planCapReached += 1;
 
     if (event.event_type === "synthesis_refinement_requested") {
       synthesisRefinementRequests += 1;
-      const attempt = normalizeCount(event.data?.attempt);
+      const attempt = normalizeCount(data?.attempt);
       if (attempt > 0) {
         synthesisAttemptsUsed = Math.max(synthesisAttemptsUsed, attempt + 1);
       }
@@ -468,7 +579,7 @@ function collectRunFinalStats(input: {
       event.event_type === "synthesis_refinement_succeeded" ||
       event.event_type === "synthesis_refinement_exhausted"
     ) {
-      const attemptsUsed = normalizeCount(event.data?.attemptsUsed);
+      const attemptsUsed = normalizeCount(data?.attemptsUsed);
       if (attemptsUsed > 0) synthesisAttemptsUsed = Math.max(synthesisAttemptsUsed, attemptsUsed);
       synthesisRefinementCompleted += 1;
     }
@@ -477,7 +588,7 @@ function collectRunFinalStats(input: {
     }
     if (event.event_type === "synthesis_review_feedback") {
       reviewFeedbacks += 1;
-      const attempt = normalizeCount(event.data?.attempt);
+      const attempt = normalizeCount(data?.attempt);
       if (attempt > 0) synthesisAttemptsUsed = Math.max(synthesisAttemptsUsed, attempt);
       reviewAttempts = Math.max(reviewAttempts, attempt || reviewAttempts);
     }
@@ -557,13 +668,23 @@ function collectRunFinalStats(input: {
 
 function printRunFinalStats(input: {
   summary: ReturnType<typeof collectRunFinalStats>;
+  log: CliLog;
 }) {
-  const { summary } = input;
-  const orderedPhases = ["plan", "retrieve", "fetch", "extract", "synthesize", "verify", "finalize", "unknown"];
+  const { summary, log } = input;
+  const orderedPhases = [
+    "plan",
+    "retrieve",
+    "fetch",
+    "extract",
+    "synthesize",
+    "verify",
+    "finalize",
+    "unknown",
+  ];
   const modelRows = orderedPhases
     .filter((phase) => summary.model.byPhase[phase]?.calls)
     .map((phase) => {
-      const bucket = summary.model.byPhase[phase];
+      const bucket = summary.model.byPhase[phase]!;
       return `    ${phase.padEnd(9)} calls=${String(bucket.calls).padStart(3)} in=${String(
         bucket.tokensIn
       ).padStart(7)} out=${String(bucket.tokensOut).padStart(7)}`;
@@ -596,41 +717,39 @@ function printRunFinalStats(input: {
   }
   const loopSummary = loopPassSummaryParts.length > 0 ? loopPassSummaryParts.join(", ") : "n/a";
 
-  console.log(`Run Status: ${summary.status}`);
-  console.log(`Run Final Stats`);
-  console.log(
+  log(`Run Status: ${summary.status}`);
+  log(`Run Final Stats`);
+  log(
     `  Time: ${
       summary.durationMs === undefined ? "unknown" : formatDurationMs(summary.durationMs)
     } (started: ${summary.startedAt}, finished: ${summary.finishedAt})`
   );
-  console.log(
+  log(
     `  Items: scanned=${summary.scannedSources} selected=${summary.totalSources} parsed=${summary.parsedSources} filtered=${summary.filteredSources} verified=${summary.verifiedClaims}`
   );
-  console.log(
+  log(
     `  Source health: failed=${summary.sourceStatusCounts.failed} skipped=${summary.sourceStatusCounts.skipped}`
   );
-  console.log(`  Verified: claims=${summary.verifiedClaims}`);
-  console.log(
+  log(`  Verified: claims=${summary.verifiedClaims}`);
+  log(
     `  Tokens: total in=${summary.model.totalTokensIn} out=${summary.model.totalTokensOut} calls=${summary.model.totalModelCalls}`
   );
-  console.log("  Tokens by phase:");
-  for (const row of modelRows) console.log(row);
-  console.log(
+  log("  Tokens by phase:");
+  for (const row of modelRows) log(row);
+  log(
     `  Retrieval: queries=${summary.retrieval.searchQueries} candidates=${summary.retrieval.discoveredUrls} result-items=${summary.retrieval.searchQueryResultCount}`
   );
-  console.log(
-    `  Loop passes: ${loopSummary}`
-  );
-  console.log(
+  log(`  Loop passes: ${loopSummary}`);
+  log(
     `  Planning: maxPass=${summary.passes.planPasses} completed=${summary.passes.planPassCompletions} continueRequests=${summary.passes.planContinueRequests} trimmed=${summary.passes.planFollowUpsTrimmed} capped=${summary.passes.planCapReached}`
   );
-  console.log(
+  log(
     `  Synthesis loop: attempts=${summary.passes.synthesisAttemptsUsed} refinementRequested=${summary.passes.synthesisRefinementRequests} reviewRequested=${summary.passes.reviewRequests} reviewFeedback=${summary.passes.reviewFeedbacks}`
   );
   if (summary.passes.reviewAttempts > 0) {
-    console.log(`  Synthesis review attempts tracked: ${summary.passes.reviewAttempts}`);
+    log(`  Synthesis review attempts tracked: ${summary.passes.reviewAttempts}`);
   }
-  console.log(
+  log(
     `  Events: total=${summary.events.total} warnings=${summary.events.warningEvents} errors=${summary.events.errorEvents}`
   );
 }
@@ -639,10 +758,12 @@ async function streamRunProgress({
   runId,
   store,
   startedAt,
+  log,
 }: {
   runId: string;
   store: PostgresStore;
   startedAt: number;
+  log: CliLog;
 }) {
   const seenEvents = new Set<string>();
   let lastPhase = "";
@@ -667,32 +788,32 @@ async function streamRunProgress({
     for (const event of [...events].reverse()) {
       if (seenEvents.has(event.id)) continue;
       seenEvents.add(event.id);
-      console.log(`[${elapsed}] ${eventLabel(event)}`);
+      log(`[${elapsed}] ${eventLabel(event)}`);
     }
 
     if (phase !== lastPhase) {
-      console.log(`[${elapsed}] Step: ${phase}`);
+      log(`[${elapsed}] Step: ${phase}`);
       lastPhase = phase;
     }
 
     if (sourceSummary !== lastSourceSummary) {
-      console.log(`[${elapsed}] Sources: ${sourceSummary}`);
+      log(`[${elapsed}] Sources: ${sourceSummary}`);
       lastSourceSummary = sourceSummary;
     }
 
     if (checkpoint !== lastCheckpoint) {
-      console.log(`[${elapsed}] Counters: ${checkpoint}`);
+      log(`[${elapsed}] Counters: ${checkpoint}`);
       lastCheckpoint = checkpoint;
     }
 
     if (run.status !== "running" && run.status !== "queued") {
-      console.log(`[${elapsed}] Final status: ${run.status}`);
+      log(`[${elapsed}] Final status: ${run.status}`);
       return;
     }
 
-    if (now - lastHeartbeat > 3000) {
+    if (now - lastHeartbeat > 60000) {
       const started = run.started_at ? ` started=${run.started_at}` : "";
-      console.log(`[${elapsed}] Running${started} — ${phase} (${sourceSummary})`);
+      log(`[${elapsed}] Running${started} — ${phase} (${sourceSummary})`);
       lastHeartbeat = now;
     }
 
@@ -705,77 +826,226 @@ program
   .description("Run the research pipeline locally (synchronous)")
   .argument("<prompt>", "Research prompt")
   .option("--debug-capture", "Enable Playwright debug capture (trace/html)", false)
-  .action(async (prompt: string, opts: { debugCapture: boolean }) => {
-    const config = await loadConfig();
-    const { store, objectStore, services } = await buildServices(config);
-    try {
-      const users = await store.listUsers();
-      const admin =
-        users.find((u) => u.role === "admin" && u.status === "active") ??
-        (await store.createUser({
-          role: "admin",
-          email: "local@openresearch",
-          policy: config.policies.defaultUserPolicy,
-        }));
-
-      const run = await store.createRun({
-        userId: admin.id,
-        prompt,
-        citationPolicy: config.citationPolicy,
-        budgets: config.budgets,
-        modelConfig: config.models,
-        adapterConfig: {
-          searchBackend: config.search.backend,
-          enablePlaywright: true,
-          thinkingMode: config.policies.qualityProfiles.full.thinkingMode,
-          debugCapture: opts.debugCapture,
-          agenticLoop: config.policies.qualityProfiles.full.agenticLoop,
-          synthesis: config.policies.qualityProfiles.full.synthesis,
-        },
-        qualityTier: "full",
-      });
-
-      const pipelineInput: Parameters<typeof runResearchPipeline>[0] = {
-        runId: run.id,
-        config,
-        services,
-      };
-      if (opts.debugCapture)
-        pipelineInput.debugCapture = { enabled: true, reason: "cli --debug-capture" };
-
-      const runStart = Date.now();
-      await Promise.all([runResearchPipeline(pipelineInput), streamRunProgress({ runId: run.id, store, startedAt: runStart })]);
-
-      const md = await objectStore.getText(runOutputKey(run.id));
-      if (md) process.stdout.write(md);
-      console.log(`\n\nRun: ${run.id}`);
-
-      const [finalRun, sources, events, modelCalls] = await Promise.all([
-        store.getRun(run.id),
-        store.listSources(run.id),
-        store.listRunEvents(run.id, { limit: 1000 }),
-        store.listModelCalls(run.id),
-      ]);
-      if (finalRun) {
-        let verifiedClaims = 0;
-        const citationMap = await objectStore.getJson( runCitationMapKey(run.id) );
-        if (citationMap && typeof citationMap === "object") {
-          const claims = (citationMap as { claims?: unknown[] }).claims;
-          if (Array.isArray(claims)) verifiedClaims = claims.length;
-        }
-        const summary = collectRunFinalStats({
-          run: finalRun as DbRun,
-          sources,
-          events,
-          modelCalls,
-          verifiedClaims,
-        });
-        printRunFinalStats({ summary });
+  .option("--no-research-loop", "Disable the iterative research loop")
+  .option("--debug-loop", "Print per-iteration research loop summaries", false)
+  .option("--advanced", "Print intermediate artifact keys (advanced)", false)
+  .action(
+    async (
+      prompt: string,
+      opts: {
+        debugCapture: boolean;
+        researchLoop: boolean;
+        debugLoop: boolean;
+        advanced: boolean;
       }
-    } finally {
+    ) => {
+      const config = await loadConfig();
+      const { store, objectStore, services } = await buildServices(config);
+      let commandError: unknown = null;
+      let pipelineLogWriter: RunLogWriter | null = null;
+      try {
+        const users = await store.listUsers();
+        const admin =
+          users.find((u) => u.role === "admin" && u.status === "active") ??
+          (await store.createUser({
+            role: "admin",
+            email: "local@openresearch",
+            policy: config.policies.defaultUserPolicy,
+          }));
+
+        const run = await store.createRun({
+          userId: admin.id,
+          prompt,
+          citationPolicy: config.citationPolicy,
+          budgets: config.budgets,
+          modelConfig: config.models,
+          adapterConfig: {
+            searchBackend: config.search.backend,
+            enablePlaywright: true,
+            thinkingMode: config.policies.qualityProfiles.full.thinkingMode,
+            debugCapture: opts.debugCapture,
+            agenticLoop: config.policies.qualityProfiles.full.agenticLoop,
+            synthesis: config.policies.qualityProfiles.full.synthesis,
+            researchLoop: {
+              ...config.policies.qualityProfiles.full.researchLoop,
+              enabled: opts.researchLoop,
+            },
+          },
+          qualityTier: "full",
+        });
+        pipelineLogWriter = createRunLogWriter({
+          runId: run.id,
+          objectStore,
+        });
+        pipelineLogWriter.log(`Run ID: ${run.id}`);
+
+        const pipelineInput: Parameters<typeof runResearchPipeline>[0] = {
+          runId: run.id,
+          config,
+          services,
+        };
+        if (opts.debugCapture)
+          pipelineInput.debugCapture = { enabled: true, reason: "cli --debug-capture" };
+
+        const runStart = Date.now();
+        await Promise.all([
+          runResearchPipeline(pipelineInput),
+          streamRunProgress({
+            runId: run.id,
+            store,
+            startedAt: runStart,
+            log: pipelineLogWriter.log,
+          }),
+        ]);
+
+        const md = await objectStore.getText(runOutputKey(run.id));
+        if (md) pipelineLogWriter.write(md);
+
+        const [finalRun, sources, events, modelCalls] = await Promise.all([
+          store.getRun(run.id),
+          store.listSources(run.id),
+          store.listRunEvents(run.id, { limit: 1000 }),
+          store.listModelCalls(run.id),
+        ]);
+        if (finalRun) {
+          let verifiedClaims = 0;
+          const citationMap = await objectStore.getJson(runCitationMapKey(run.id));
+          if (citationMap && typeof citationMap === "object") {
+            const claims = (citationMap as { claims?: unknown[] }).claims;
+            if (Array.isArray(claims)) verifiedClaims = claims.length;
+          }
+          const summary = collectRunFinalStats({
+            run: finalRun as DbRun,
+            sources,
+            events,
+            modelCalls,
+            verifiedClaims,
+          });
+          printRunFinalStats({ summary, log: pipelineLogWriter.log });
+
+          if (opts.debugLoop || opts.advanced) {
+            const state = finalRun.state as unknown;
+            const researchLoop =
+              state && typeof state === "object" && !Array.isArray(state)
+                ? ((state as { researchLoop?: unknown }).researchLoop as unknown)
+                : undefined;
+
+            const loopObject =
+              researchLoop && typeof researchLoop === "object" && !Array.isArray(researchLoop)
+                ? (researchLoop as Record<string, unknown>)
+                : null;
+
+            if (!loopObject) {
+              pipelineLogWriter.log("\nResearch loop: not present in checkpoint state");
+            } else {
+              const enabled =
+                typeof loopObject.enabled === "boolean" ? loopObject.enabled : undefined;
+              const mode = typeof loopObject.mode === "string" ? loopObject.mode : "unknown";
+              const modeSetting =
+                typeof loopObject.modeSetting === "string" ? loopObject.modeSetting : "unknown";
+              const stopReason =
+                typeof loopObject.stopReason === "string" ? loopObject.stopReason : "unknown";
+              const iterations = Array.isArray(loopObject.iterations)
+                ? (loopObject.iterations as unknown[])
+                : [];
+              const iterationCountCompleted =
+                typeof loopObject.iterationCountCompleted === "number" &&
+                Number.isFinite(loopObject.iterationCountCompleted)
+                  ? loopObject.iterationCountCompleted
+                  : iterations.length;
+
+              pipelineLogWriter.log(
+                `\nResearch loop: enabled=${String(enabled)} modeSetting=${modeSetting} mode=${mode} stopReason=${stopReason} iterations=${iterationCountCompleted}`
+              );
+
+              for (const raw of iterations) {
+                if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+                const it = raw as Record<string, unknown>;
+                const iteration =
+                  typeof it.iteration === "number" && Number.isFinite(it.iteration)
+                    ? it.iteration
+                    : 0;
+                const itMode = typeof it.mode === "string" ? it.mode : "unknown";
+                const netNewSources =
+                  typeof it.netNewSources === "number" && Number.isFinite(it.netNewSources)
+                    ? it.netNewSources
+                    : 0;
+                const reviewVerdict =
+                  typeof it.reviewVerdict === "string" ? it.reviewVerdict : "unknown";
+                const itStopReason = typeof it.stopReason === "string" ? it.stopReason : null;
+
+                pipelineLogWriter.log(
+                  `  [${iteration}] mode=${itMode} netNewSources=${netNewSources} review=${reviewVerdict}${
+                    itStopReason ? ` stopReason=${itStopReason}` : ""
+                  }`
+                );
+
+                const artifacts =
+                  it.artifacts && typeof it.artifacts === "object" && !Array.isArray(it.artifacts)
+                    ? (it.artifacts as Record<string, unknown>)
+                    : null;
+                const planKey =
+                  artifacts && typeof artifacts.planKey === "string" ? artifacts.planKey : null;
+
+                if (opts.debugLoop && planKey) {
+                  const plan = await objectStore.getJson(planKey);
+                  if (plan && typeof plan === "object" && !Array.isArray(plan)) {
+                    const outputs = (plan as { outputs?: unknown }).outputs;
+                    if (outputs && typeof outputs === "object" && !Array.isArray(outputs)) {
+                      const out = outputs as Record<string, unknown>;
+                      const nextQueries = Array.isArray(out.nextQueries)
+                        ? (out.nextQueries as unknown[])
+                            .filter((q) => typeof q === "string")
+                            .slice(0, 6)
+                        : [];
+                      const nextTasks = Array.isArray(out.nextTasks)
+                        ? (out.nextTasks as unknown[])
+                            .filter((t) => typeof t === "string")
+                            .slice(0, 6)
+                        : [];
+                      const notes = Array.isArray(out.planNotes)
+                        ? (out.planNotes as unknown[])
+                            .filter((n) => typeof n === "string")
+                            .slice(0, 3)
+                        : [];
+                      pipelineLogWriter.log(
+                        `    nextQueries: ${nextQueries.length ? nextQueries.join(" | ") : "n/a"}`
+                      );
+                        pipelineLogWriter.log(
+                        `    nextTasks: ${nextTasks.length ? nextTasks.join(" | ") : "n/a"}`
+                      );
+                      if (notes.length)
+                      pipelineLogWriter.log(`    planNotes: ${notes.join(" | ")}`);
+                    }
+                  }
+                }
+
+              if (opts.advanced && artifacts) {
+                const keys: Array<[string, string]> = [];
+                for (const [k, v] of Object.entries(artifacts)) {
+                  if (typeof v === "string" && v.trim()) keys.push([k, v.trim()]);
+                }
+                  if (keys.length) {
+                    pipelineLogWriter.log("    artifacts:");
+                    for (const [k, v] of keys) pipelineLogWriter.log(`      ${k}: ${v}`);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (error) {
+        commandError = error;
+      }
+      if (pipelineLogWriter) {
+        await pipelineLogWriter.flush();
+      }
       await store.close();
+      if (commandError !== null) {
+        throw commandError;
+      }
     }
-  });
+  );
 
 program
   .command("resume")

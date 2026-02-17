@@ -55,6 +55,29 @@ export function stripPromptInjection(text: string): string {
   return kept.join("\n");
 }
 
+export function isExtractStackOverflowError(error: unknown): boolean {
+  if (error instanceof RangeError) {
+    return /maximum call stack size exceeded/i.test(error.message);
+  }
+
+  if (error && typeof error === "object") {
+    const named = (error as { name?: unknown }).name;
+    const msg = (error as { message?: unknown }).message;
+    if (typeof named === "string" && named === "RangeError" && typeof msg === "string") {
+      return /maximum call stack size exceeded/i.test(msg);
+    }
+    if (typeof msg === "string") {
+      return /maximum call stack size exceeded/i.test(msg);
+    }
+  }
+
+  if (error instanceof Error) {
+    return /maximum call stack size exceeded/i.test(error.message);
+  }
+
+  return false;
+}
+
 function normalizeWhitespace(text: string): string {
   return (
     text
@@ -125,6 +148,97 @@ function buildChunks(
   return chunks;
 }
 
+function stripTagBlockText(html: string, tagName: string): string {
+  const lowerTag = tagName.toLowerCase();
+  const lower = html.toLowerCase();
+  const openTag = `<${lowerTag}`;
+  const closeTag = `</${lowerTag}>`;
+
+  const findCloseTag = (start: number): number => {
+    let inSingle = false;
+    let inDouble = false;
+    let inBacktick = false;
+    let escaped = false;
+
+    for (let i = start; i < lower.length; i += 1) {
+      const ch = lower[i]!;
+      const next = lower[i + 1] ?? "";
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (inSingle) {
+        if (ch === "\\" && next) {
+          escaped = true;
+          continue;
+        }
+        if (ch === "'") inSingle = false;
+        continue;
+      }
+
+      if (inDouble) {
+        if (ch === "\\" && next) {
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') inDouble = false;
+        continue;
+      }
+
+      if (inBacktick) {
+        if (ch === "\\" && next) {
+          escaped = true;
+          continue;
+        }
+        if (ch === "`") inBacktick = false;
+        continue;
+      }
+
+      if (ch === "'") {
+        inSingle = true;
+      } else if (ch === '"') {
+        inDouble = true;
+      } else if (ch === "`") {
+        inBacktick = true;
+      } else if (lower.startsWith(closeTag, i)) {
+        return i;
+      }
+    }
+
+    return -1;
+  };
+
+  let result = "";
+  let cursor = 0;
+
+  while (cursor < lower.length) {
+    const openIndex = lower.indexOf(openTag, cursor);
+    if (openIndex < 0) {
+      result += html.slice(cursor);
+      break;
+    }
+
+    result += html.slice(cursor, openIndex);
+
+    const openTagClose = lower.indexOf(">", openIndex);
+    if (openTagClose < 0) {
+      break;
+    }
+
+    const contentStart = openTagClose + 1;
+    const closeIndex = findCloseTag(contentStart);
+    if (closeIndex < 0) {
+      break;
+    }
+
+    cursor = closeIndex + closeTag.length;
+  }
+
+  return result;
+}
+
 export function extractFromHtml(html: string, opts?: { url?: string }): ExtractedEvidence {
   const dom = new JSDOM(html, { url: opts?.url ?? "https://example.invalid" });
   const doc = dom.window.document;
@@ -174,6 +288,24 @@ export function extractFromHtml(html: string, opts?: { url?: string }): Extracte
     quotes: buildQuotes(contentText, 5),
     chunks: buildChunks(contentText, { chunkSize: 2000, overlap: 200 }),
   };
+}
+
+export function extractTextFromHtml(
+  html: string,
+  metadata?: Partial<ExtractedMetadata>
+): ExtractedEvidence {
+  const withoutScripts = stripTagBlockText(html, "script");
+  const withoutStyles = withoutScripts.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  const withoutTags = withoutStyles.replace(/<[^>]+>/g, " ");
+  const withoutHtmlEntities = withoutTags
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+
+  return extractFromText(withoutHtmlEntities.replace(/\s+/g, " "), metadata);
 }
 
 export function extractFromText(

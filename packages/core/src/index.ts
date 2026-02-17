@@ -9,4 +9,5 @@ export * from "./artifacts.js";
 export * from "./memo.js";
 export * from "./verify.js";
 export * from "./orchestrator.js";
+export * from "./research-loop.js";
 export * from "./model-router.js";

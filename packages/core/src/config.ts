@@ -68,6 +68,20 @@ export const SynthesisConfigSchema = z.object({
 });
 export type SynthesisConfig = z.infer<typeof SynthesisConfigSchema>;
 
+export const ResearchLoopModeSchema = z.enum(["auto", "incremental", "hybrid"]).default("auto");
+export type ResearchLoopMode = z.infer<typeof ResearchLoopModeSchema>;
+
+export const ResearchLoopConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    maxIterations: z.number().int().positive().default(5),
+    sourcesPerIteration: z.number().int().positive().optional(),
+    mode: ResearchLoopModeSchema,
+    switchToHybridAfterRejects: z.number().int().positive().default(2),
+  })
+  .default({});
+export type ResearchLoopConfig = z.infer<typeof ResearchLoopConfigSchema>;
+
 export const QualityProfileSchema = z.object({
   name: z.string().optional(),
   searchBackend: z.enum(["searxng", "brave"]).default("searxng"),
@@ -76,6 +90,7 @@ export const QualityProfileSchema = z.object({
   budgets: BudgetConfigSchema.partial().default({}),
   agenticLoop: AgenticLoopConfigSchema.default({}),
   synthesis: SynthesisConfigSchema.default({}),
+  researchLoop: ResearchLoopConfigSchema,
   enablePlaywright: z.boolean().default(true),
 });
 export type QualityProfile = z.infer<typeof QualityProfileSchema>;
