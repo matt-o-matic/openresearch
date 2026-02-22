@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CitationMap, SynthesisOutput } from "./memo.js";
-import { renderResearchMemoMarkdown } from "./memo.js";
+import { renderResearchMemoMarkdown, SynthesisOutputSchema } from "./memo.js";
 
 describe("memo rendering", () => {
   it("renders a stable research memo markdown", () => {
@@ -70,5 +70,26 @@ describe("memo rendering", () => {
       [^S2]: Example 2 — https://example.com/2 (fetched 2020-01-01T00:00:00.000Z)
       "
     `);
+  });
+
+  it("does not throw when keyFindings is empty", () => {
+    const parsed = SynthesisOutputSchema.safeParse({
+      summary: "A short summary.",
+      keyFindings: [],
+      unknowns: [],
+    });
+    if (!parsed.success) throw parsed.error;
+
+    const citationMap: CitationMap = {
+      version: 1,
+      runId: "run-empty",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      policy: "balanced",
+      sources: [],
+      claims: [],
+    };
+
+    const md = renderResearchMemoMarkdown({ synthesis: parsed.data, citationMap });
+    expect(md).toContain("## Key findings");
   });
 });

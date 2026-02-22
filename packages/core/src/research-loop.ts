@@ -461,10 +461,37 @@ function shouldStopForDiminishingReturns(input: {
   return input.lowValueIterationStreak >= 2 && input.nextStepsEmpty;
 }
 
-const LAND_THE_PLANE_FINALIZE_RESERVE_MS = 30_000;
+function computeQuestionGraphMaxDepth(graph: QuestionGraph): number {
+  if (!graph.questions.length) return 0;
+  const byId = new Map(graph.questions.map((q) => [q.id, q]));
+  const memo = new Map<string, number>();
+  const visiting = new Set<string>();
 
-function remainingTimeMs(deadlineMs: number): number {
-  return Math.max(0, deadlineMs - Date.now());
+  const depthFrom = (id: string): number => {
+    if (memo.has(id)) return memo.get(id)!;
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    const q = byId.get(id);
+    if (!q) {
+      visiting.delete(id);
+      memo.set(id, 0);
+      return 0;
+    }
+    let max = 0;
+    for (const dep of q.dependsOn) {
+      max = Math.max(max, depthFrom(dep));
+    }
+    visiting.delete(id);
+    const depth = q.dependsOn.length ? max + 1 : 0;
+    memo.set(id, depth);
+    return depth;
+  };
+
+  let maxDepth = 0;
+  for (const q of graph.questions) {
+    maxDepth = Math.max(maxDepth, depthFrom(q.id));
+  }
+  return maxDepth;
 }
 
 function applyQuestionUpdates(input: {
@@ -572,6 +599,11 @@ export async function runResearchLoop(input: {
         })
   );
   (input.checkpoint as { questionGraph?: QuestionGraph }).questionGraph = questionGraph;
+
+  const maxFocusRoundsPerQuestion = 2;
+  const maxDependencyDepth = computeQuestionGraphMaxDepth(questionGraph);
+  const derivedMaxIterations = Math.max(1, maxFocusRoundsPerQuestion * (maxDependencyDepth + 1));
+  loopState.maxIterations = derivedMaxIterations;
 
   let existing = normalizeSources(await input.services.store.listSources(input.runId));
   const seenUrls = new Set<string>([
@@ -737,11 +769,6 @@ export async function runResearchLoop(input: {
     .catch(() => {});
 
   while (!loopState.stopReason && loopState.iterationCountCompleted < loopState.maxIterations) {
-    if (remainingTimeMs(input.deadlineMs) <= LAND_THE_PLANE_FINALIZE_RESERVE_MS) {
-      loopState.stopReason = "budget_exhausted";
-      break;
-    }
-
     existing = normalizeSources(await input.services.store.listSources(input.runId));
     for (const url of existing.urls) seenUrls.add(url);
     loopState.seenUrls = Array.from(seenUrls);
@@ -780,12 +807,6 @@ export async function runResearchLoop(input: {
 
     const nextQueries = pendingFiltered.queries.slice(0, 8);
     const nextTasks = pendingFiltered.tasks.slice(0, 8);
-    if (nextQueries.length === 0 && nextTasks.length === 0) {
-      loopState.stopReason = "diminishing_returns";
-      iterationEntry.stopReason = "diminishing_returns";
-      iterationEntry.completedAt = new Date().toISOString();
-      break;
-    }
 
     iterationEntry.queries = nextQueries;
     iterationEntry.tasks = nextTasks;
@@ -836,29 +857,6 @@ export async function runResearchLoop(input: {
     loopState.seenTasks = Array.from(seenTasks);
     await persistCheckpoint();
 
-    if (iterationEntry.selectedUrls.length === 0) {
-      loopState.stopReason = "no_new_sources";
-      iterationEntry.stopReason = "no_new_sources";
-      iterationEntry.completedAt = new Date().toISOString();
-      loopState.iterationCountCompleted = iterationEntry.iteration;
-      await persistCheckpoint();
-      await persistImmutableCheckpoint({
-        kind: "iteration",
-        iterationCompleted: loopState.iterationCountCompleted,
-      });
-      await input.services.store
-        .addRunEvent({
-          runId: input.runId,
-          level: "warn",
-          phase: "retrieve",
-          eventType: "research_loop_no_new_sources",
-          message: `Iteration ${iterationEntry.iteration} selected 0 net-new URLs; stopping loop`,
-          data: { iteration: iterationEntry.iteration },
-        })
-        .catch(() => {});
-      break;
-    }
-
     const iterationSourceIds: string[] = [];
     for (const url of iterationEntry.selectedUrls) {
       const existingRow = existing.byUrl.get(url);
@@ -877,27 +875,29 @@ export async function runResearchLoop(input: {
     loopState.iterationCountCompleted = iterationEntry.iteration - 1;
     await persistCheckpoint();
 
-    await input.steps.fetch({
-      runId: input.runId,
-      userId: input.userId,
-      budgets: input.budgets,
-      checkpoint: input.checkpoint,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-      httpFetch: input.services.httpFetch,
-      onlySourceIds: iterationEntry.sourceIds,
-    });
+    if (iterationEntry.sourceIds.length > 0) {
+      await input.steps.fetch({
+        runId: input.runId,
+        userId: input.userId,
+        budgets: input.budgets,
+        checkpoint: input.checkpoint,
+        store: input.services.store,
+        objectStore: input.services.objectStore,
+        httpFetch: input.services.httpFetch,
+        onlySourceIds: iterationEntry.sourceIds,
+      });
 
-    await input.steps.extract({
-      runId: input.runId,
-      userId: input.userId,
-      budgets: input.budgets,
-      checkpoint: input.checkpoint,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-      browser: input.services.browserRender,
-      onlySourceIds: iterationEntry.sourceIds,
-    });
+      await input.steps.extract({
+        runId: input.runId,
+        userId: input.userId,
+        budgets: input.budgets,
+        checkpoint: input.checkpoint,
+        store: input.services.store,
+        objectStore: input.services.objectStore,
+        browser: input.services.browserRender,
+        onlySourceIds: iterationEntry.sourceIds,
+      });
+    }
 
     existing = normalizeSources(await input.services.store.listSources(input.runId));
     for (const url of existing.urls) seenUrls.add(url);
@@ -1006,15 +1006,13 @@ export async function runResearchLoop(input: {
     await input.services.objectStore.putJson(iterationEntry.artifacts.verificationJsonKey, report);
     await input.services.objectStore.putText(iterationEntry.artifacts.verificationMarkdownKey, markdown);
 
-    const landThePlaneNow = remainingTimeMs(input.deadlineMs) <= LAND_THE_PLANE_FINALIZE_RESERVE_MS;
-
     let reviewOutput: IterationReviewOutput = {
       verdict: "accept",
       unsupportedConclusions: [],
       missingEvidence: [],
       requestedRevisions: [],
     };
-    if (!landThePlaneNow && input.services.modelProvider) {
+    if (input.services.modelProvider) {
       const review = await input.steps.review({
         runId: input.runId,
         userId: input.userId,
@@ -1049,48 +1047,6 @@ export async function runResearchLoop(input: {
         },
       })
       .catch(() => {});
-
-    if (landThePlaneNow) {
-      loopState.stopReason = "budget_exhausted";
-      iterationEntry.stopReason = "budget_exhausted";
-      iterationEntry.completedAt = new Date().toISOString();
-      loopState.iterationCountCompleted = iterationEntry.iteration;
-      await persistCheckpoint();
-      await persistImmutableCheckpoint({
-        kind: "iteration",
-        iterationCompleted: loopState.iterationCountCompleted,
-        sources: allLabeledSources,
-      });
-      await input.services.store
-        .addRunEvent({
-          runId: input.runId,
-          level: "warn",
-          phase: "retrieve",
-          eventType: "land_the_plane",
-          message: `Landing the plane after iteration ${iterationEntry.iteration} (timeRemainingMs=${remainingTimeMs(input.deadlineMs)})`,
-          data: {
-            iteration: iterationEntry.iteration,
-            timeRemainingMs: remainingTimeMs(input.deadlineMs),
-          },
-        })
-        .catch(() => {});
-      await input.services.store
-        .addRunEvent({
-          runId: input.runId,
-          level: "info",
-          phase: "retrieve",
-          eventType: "research_iteration_completed",
-          message: `Iteration ${iterationEntry.iteration} completed (netNewSources=${iterationEntry.netNewSources}, mode=${iterationEntry.mode}, stopReason=budget_exhausted)`,
-          data: {
-            iteration: iterationEntry.iteration,
-            netNewSources: iterationEntry.netNewSources,
-            mode: iterationEntry.mode,
-            stopReason: "budget_exhausted",
-          },
-        })
-        .catch(() => {});
-      break;
-    }
 
     if (reviewOutput.verdict === "reject") {
       loopState.rejectCount += 1;
@@ -1135,7 +1091,8 @@ export async function runResearchLoop(input: {
         }
 
         const remaining = {
-          timeRemainingMs: Math.max(0, input.deadlineMs - Date.now()),
+          timeRemainingMs: null,
+          timeBudgetEnforced: false,
           sourcesRemaining: Math.max(0, input.budgets.maxSources - existing.sources.length),
           fetchesRemaining: Math.max(0, input.budgets.maxFetches - input.checkpoint.counters.fetches),
           rendersRemaining: Math.max(0, input.budgets.maxBrowserRenders - input.checkpoint.counters.renders),
@@ -1310,26 +1267,28 @@ export async function runResearchLoop(input: {
       }
     }
 
-    // Heuristic: if an unblocked question is repeatedly reported as unanswered with confidence=0 and
-    // no evidence across multiple iterations, treat it as "unanswerable within the retrieved corpus"
-    // so it stops blocking the run forever.
-    const UNANSWERABLE_STREAK_THRESHOLD = 2;
+    // Heuristic: each unblocked open question gets at most `maxFocusRoundsPerQuestion` iterations.
+    // If it still isn't answered after that focus window, mark it "unanswerable" so dependents can unblock.
+    const isResolved = (status: QuestionStatus) => status === "answered" || status === "unanswerable";
     const unblockedIdsForStreak = new Set(computeUnblockedQuestions(questionGraph).map((q) => q.id));
-    const unansweredStreaks = loopState.unansweredStreaks;
-    const newlyUnanswerable: Array<{ id: string; streak: number }> = [];
+    const focusStreaks = loopState.unansweredStreaks;
+    const newlyUnanswerable: Array<{ id: string; streak: number; priorStatus: QuestionStatus; confidence: number | null; evidenceCount: number }> = [];
 
     for (const q of questionGraph.questions) {
       const isCandidate =
-        unblockedIdsForStreak.has(q.id) &&
-        q.status === "unanswered" &&
-        (q.evidence?.length ?? 0) === 0 &&
-        q.confidence === 0;
+        unblockedIdsForStreak.has(q.id) && !isResolved(q.status);
 
-      const nextStreak = isCandidate ? (unansweredStreaks[q.id] ?? 0) + 1 : 0;
-      unansweredStreaks[q.id] = nextStreak;
+      const nextStreak = isCandidate ? (focusStreaks[q.id] ?? 0) + 1 : 0;
+      focusStreaks[q.id] = nextStreak;
 
-      if (isCandidate && nextStreak >= UNANSWERABLE_STREAK_THRESHOLD) {
-        newlyUnanswerable.push({ id: q.id, streak: nextStreak });
+      if (isCandidate && nextStreak >= maxFocusRoundsPerQuestion) {
+        newlyUnanswerable.push({
+          id: q.id,
+          streak: nextStreak,
+          priorStatus: q.status,
+          confidence: q.confidence ?? null,
+          evidenceCount: q.evidence?.length ?? 0,
+        });
       }
     }
 
@@ -1340,14 +1299,17 @@ export async function runResearchLoop(input: {
         questions: questionGraph.questions.map((q) => {
           const match = byId.get(q.id);
           if (!match) return q;
+          const existingEvidence = Array.isArray(q.evidence) ? q.evidence : [];
           return {
             ...q,
             status: "unanswerable",
             evidence: [
+              ...existingEvidence,
               {
                 note:
-                  `Marked unanswerable after ${match.streak} iterations with no evidence (confidence=0). ` +
-                  "This indicates the answer was not found in the retrieved public sources for this run.",
+                  `Focus cap reached: after ${match.streak} iteration(s) this question is still ${match.priorStatus}` +
+                  (match.confidence !== null ? ` (confidence=${match.confidence.toFixed(2)})` : "") +
+                  ` with ${match.evidenceCount} evidence item(s). Marked unanswerable to unblock dependents.`,
               },
             ],
             updatedAtIteration: iterationEntry.iteration,
@@ -1362,11 +1324,18 @@ export async function runResearchLoop(input: {
           level: "info",
           phase: "plan",
           eventType: "question_marked_unanswerable",
-          message: `Marked ${newlyUnanswerable.length} question(s) as unanswerable after repeated zero-evidence iterations`,
+          message: `Marked ${newlyUnanswerable.length} question(s) as unanswerable after focus cap`,
           data: {
             iteration: iterationEntry.iteration,
-            threshold: UNANSWERABLE_STREAK_THRESHOLD,
-            questions: newlyUnanswerable,
+            maxFocusRoundsPerQuestion,
+            reason: "focus_round_cap",
+            questions: newlyUnanswerable.map((q) => ({
+              id: q.id,
+              focusStreak: q.streak,
+              priorStatus: q.priorStatus,
+              confidence: q.confidence,
+              evidenceCount: q.evidenceCount,
+            })),
           },
         })
         .catch(() => {});
@@ -1546,13 +1515,8 @@ export async function runResearchLoop(input: {
     } else if (iterationEntry.iteration >= loopState.maxIterations) {
       shouldStop = true;
       stopReason = "iteration_cap";
-    } else if (remainingTimeMs(input.deadlineMs) <= LAND_THE_PLANE_FINALIZE_RESERVE_MS) {
-      shouldStop = true;
-      stopReason = "budget_exhausted";
-    } else if (selectedNewUrls.length === 0) {
-      shouldStop = true;
-      stopReason = "no_new_sources";
     } else if (
+      openUnblocked.length === 0 &&
       shouldStopForDiminishingReturns({
         lowValueIterationStreak: loopState.lowValueIterationStreak,
         nextStepsEmpty: nextQueriesOut.length + nextTasksOut.length === 0,

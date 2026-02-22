@@ -36,7 +36,7 @@ export const SynthesisOutputSchema = z.object({
       })
     )
     .optional(),
-  keyFindings: z.array(SynthesisClaimSchema).min(1),
+  keyFindings: z.array(SynthesisClaimSchema).default([]),
   contradictions: z.array(z.string().min(1)).optional(),
   recommendations: z.array(z.string().min(1)).optional(),
   negativeSpace: z
