@@ -2518,6 +2518,58 @@ async function callModelTextLogged(input: {
       throw emptyNormalizedError;
     }
 
+    const normalizedTrimmed = normalizedText.trim();
+    const looksStructuredPayload =
+      normalizedTrimmed.startsWith("{") || normalizedTrimmed.startsWith("[");
+    if (looksStructuredPayload) {
+      try {
+        JSON.parse(normalizedTrimmed);
+      } catch (jsonError) {
+        const parseError = new Error("Malformed structured output from model");
+        await persistResponseError({
+          ...callError(parseError),
+          reason: `response looked like JSON but failed to parse on attempt ${attempt}`,
+          attempt,
+          responseArtifact,
+          rawResponse: normalizedResponse.text,
+          rawResponseLength: normalizedResponse.text.length,
+          rawResponsePreview: normalizedResponse.text.slice(0, 500),
+        });
+        if (attempt < MODEL_CALL_MAX_ATTEMPTS) {
+          await emitRetryEvent(attempt, "response parse or schema validation", jsonError, {
+            rawResponsePreview: normalizedResponse.text.slice(0, 500),
+            rawResponseLength: normalizedResponse.text.length,
+          });
+          continue;
+        }
+        throw parseError;
+      }
+    }
+
+    const looksLikeMarkdownDraft =
+      /(^|\n)#{1,6}\s+\S/m.test(normalizedTrimmed) || /(^|\n)-\s+\S/m.test(normalizedTrimmed);
+    const requiresDraftShape = persona === "synthesis-writing";
+    if (requiresDraftShape && !looksStructuredPayload && !looksLikeMarkdownDraft && normalizedTrimmed.length < 500) {
+      const shapeError = new Error("Model response did not resemble a complete markdown draft");
+      await persistResponseError({
+        ...callError(shapeError),
+        reason: `response lacked markdown draft structure on attempt ${attempt}`,
+        attempt,
+        responseArtifact,
+        rawResponse: normalizedResponse.text,
+        rawResponseLength: normalizedResponse.text.length,
+        rawResponsePreview: normalizedResponse.text.slice(0, 500),
+      });
+      if (attempt < MODEL_CALL_MAX_ATTEMPTS) {
+        await emitRetryEvent(attempt, "response parse or schema validation", shapeError, {
+          rawResponsePreview: normalizedResponse.text.slice(0, 500),
+          rawResponseLength: normalizedResponse.text.length,
+        });
+        continue;
+      }
+      throw shapeError;
+    }
+
     const responsePersisted = await persistResponse(
       {
         ...normalizedResponse,
@@ -5085,7 +5137,7 @@ function buildSynthesisMarkdownPromptPayload(input: {
   reviewFeedback?: SynthesisReviewFeedbackPayload;
   targets: SynthesisPromptTargets;
   refinementPass?: number;
-}): unknown {
+}): Record<string, unknown> {
   return {
     prompt: input.prompt,
     citationPolicy: input.citationPolicy,
@@ -5124,6 +5176,24 @@ function buildSynthesisMarkdownPromptPayload(input: {
         "Sources",
       ],
       citationStyle: "Inline square-bracket source labels like [S1] and optional quote IDs like [S1:Q2].",
+    },
+    requestedOutputShape: {
+      summary: "string",
+      keyFindings: [
+        {
+          id: "F1",
+          text: "string",
+          citations: [{ source: "S1", quoteId: "Q1" }],
+        },
+      ],
+      recommendations: ["string"],
+      contradictions: ["string"],
+      unknowns: ["string"],
+      negativeSpace: {
+        missingLinks: ["string"],
+        unaskedQuestions: ["string"],
+        temporalBlindspots: ["string"],
+      },
     },
   };
 }
@@ -6146,9 +6216,10 @@ async function reviewSynthesisMarkdownDraft(input: {
                 : undefined,
             };
           }),
+          draft: input.draftMarkdown,
           draftMarkdown: input.draftMarkdown,
           reviewRequest:
-            "Review this Markdown draft as the final deliverable. Mark unsupported claims, missing evidence, and concrete revision actions. Return accept only when publication-ready.",
+            "Attack the report sentence-by-sentence. Review this Markdown draft as the final deliverable, mark unsupported claims, missing evidence, and concrete revision actions. Return accept only when publication-ready.",
         }),
       },
     ],
@@ -6203,6 +6274,176 @@ function buildDeterministicMarkdownSynthesis(input: {
     ...(sources.length > 0 ? sources : ["- No sources available."]),
     "",
   ].join("\n");
+}
+
+function stringifyDraftValue(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizeDraftStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => stringifyDraftValue(item))
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function formatDraftCitation(citation: unknown): string | null {
+  if (!citation || typeof citation !== "object" || Array.isArray(citation)) return null;
+  const source = stringifyDraftValue((citation as { source?: unknown }).source);
+  if (!source) return null;
+  const quoteId = stringifyDraftValue((citation as { quoteId?: unknown }).quoteId);
+  return quoteId ? `${source}:${quoteId}` : source;
+}
+
+function maybeCoerceStructuredDraftToMarkdown(input: {
+  draft: string;
+  sources: SynthesisSourceBrief[];
+}): { markdown: string; mode: string } | null {
+  const trimmed = input.draft.trim();
+  if (!trimmed.startsWith("{")) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const payload = parsed as Record<string, unknown>;
+
+  const hasStructuredFields =
+    "summary" in payload ||
+    "keyFindings" in payload ||
+    "recommendations" in payload ||
+    "unknowns" in payload;
+  if (!hasStructuredFields) return null;
+
+  const summary = stringifyDraftValue(payload.summary) || "No summary was returned.";
+  const keyFindingsRaw = Array.isArray(payload.keyFindings) ? payload.keyFindings : [];
+  const keyFindings = keyFindingsRaw
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return stringifyDraftValue(item);
+      }
+      const finding = item as { text?: unknown; citations?: unknown };
+      const text = stringifyDraftValue(finding.text);
+      const citationTokens = Array.isArray(finding.citations)
+        ? finding.citations.map((citation) => formatDraftCitation(citation)).filter(Boolean)
+        : [];
+      const citationSuffix = citationTokens.length ? ` [${citationTokens.join(", ")}]` : "";
+      return `${text || "Unlabeled finding."}${citationSuffix}`;
+    })
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  const recommendations = normalizeDraftStringList(payload.recommendations);
+  const contradictions = normalizeDraftStringList(payload.contradictions);
+  const unknowns = normalizeDraftStringList(payload.unknowns);
+  const thematicSynthesisRaw = Array.isArray(payload.thematicSynthesis)
+    ? payload.thematicSynthesis
+    : [];
+  const thematicSynthesis = thematicSynthesisRaw
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        const fallback = stringifyDraftValue(item);
+        return fallback ? { theme: "Theme", details: fallback } : null;
+      }
+      const themeItem = item as {
+        theme?: unknown;
+        observation?: unknown;
+        inference?: unknown;
+        implication?: unknown;
+      };
+      const theme = stringifyDraftValue(themeItem.theme) || "Theme";
+      const observation = stringifyDraftValue(themeItem.observation);
+      const inference = stringifyDraftValue(themeItem.inference);
+      const implication = stringifyDraftValue(themeItem.implication);
+      const details = [observation, inference, implication].filter((part) => part.length > 0);
+      return {
+        theme,
+        details: details.join(" "),
+      };
+    })
+    .filter((item): item is { theme: string; details: string } => Boolean(item?.details));
+  const negativeSpace =
+    payload.negativeSpace && typeof payload.negativeSpace === "object" && !Array.isArray(payload.negativeSpace)
+      ? (payload.negativeSpace as Record<string, unknown>)
+      : null;
+  const missingLinks = normalizeDraftStringList(negativeSpace?.missingLinks);
+  const unaskedQuestions = normalizeDraftStringList(negativeSpace?.unaskedQuestions);
+  const temporalBlindspots = normalizeDraftStringList(negativeSpace?.temporalBlindspots);
+
+  const sourceByLabel = new Map<string, string>();
+  for (const source of input.sources) sourceByLabel.set(source.source, source.url);
+  const sourcesSection = input.sources.map((source) => `- [${source.source}] ${source.url}`);
+
+  const lines = [
+    "# Research memo",
+    "",
+    "## Executive Summary",
+    "",
+    summary,
+    "",
+    "## Key Findings",
+    "",
+    ...(keyFindings.length > 0 ? keyFindings.map((item) => `- ${item}`) : ["- No key findings were provided."]),
+  ];
+
+  if (thematicSynthesis.length > 0) {
+    lines.push("", "## Thematic Synthesis", "");
+    for (const item of thematicSynthesis) {
+      lines.push(`### ${item.theme}`, "", item.details, "");
+    }
+  }
+
+  if (recommendations.length > 0) {
+    lines.push("", "## Recommendations", "", ...recommendations.map((item) => `- ${item}`));
+  }
+  if (contradictions.length > 0) {
+    lines.push("", "## Contradictions", "", ...contradictions.map((item) => `- ${item}`));
+  }
+  if (unknowns.length > 0) {
+    lines.push("", "## Unknowns", "", ...unknowns.map((item) => `- ${item}`));
+  }
+  if (missingLinks.length > 0 || unaskedQuestions.length > 0 || temporalBlindspots.length > 0) {
+    lines.push("", "## Negative Space", "");
+    if (missingLinks.length > 0) {
+      lines.push("### Missing Links", "", ...missingLinks.map((item) => `- ${item}`), "");
+    }
+    if (unaskedQuestions.length > 0) {
+      lines.push("### Unasked Questions", "", ...unaskedQuestions.map((item) => `- ${item}`), "");
+    }
+    if (temporalBlindspots.length > 0) {
+      lines.push(
+        "### Temporal Blindspots",
+        "",
+        ...temporalBlindspots.map((item) => `- ${item}`),
+        ""
+      );
+    }
+  }
+
+  lines.push(
+    "## Sources",
+    "",
+    ...(sourcesSection.length > 0
+      ? sourcesSection
+      : Array.from(sourceByLabel.entries()).map(([label, url]) => `- [${label}] ${url}`)),
+    ""
+  );
+
+  return {
+    markdown: lines.join("\n"),
+    mode: "synthesis-writing-json-to-markdown-shim",
+  };
 }
 
 async function synthesizeMarkdownPhase(input: {
@@ -6295,6 +6536,61 @@ async function synthesizeMarkdownPhase(input: {
   let lastReviewVerdict: SynthesisReviewOutput["verdict"] | undefined;
   let lastMarkdownDraft = "";
   let lastTrimResult: SynthesisContextTrimResult | null = null;
+  const logOutputCapEvent = async (
+    trimResult: SynthesisContextTrimResult,
+    outputCapFromContext: number,
+    outputTokensToUse: number
+  ) => {
+    if (trimResult.trimmed) {
+      await input.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "warn",
+          phase: "synthesize",
+          eventType: "synthesis_context_trimmed",
+          message: "Synthesis context exceeded input token budget and was trimmed",
+          data: {
+            budgetTokensApplied: input.maxInputTokens,
+            requestedInputBudget: input.requestedMaxInputTokens,
+            inputTokensBefore: trimResult.inputTokensBefore,
+            inputTokensAfter: trimResult.inputTokensAfter,
+            sourceCountBefore: trimResult.sourceCountBefore,
+            sourceCountAfter: trimResult.sourceCountAfter,
+            sourceCountCap,
+            quoteCountCap,
+            requestedOutputTokens: input.requestedMaxOutputTokens,
+            outputTokensApplied: outputTokensToUse,
+            outputCapFromContext,
+          },
+        })
+        .catch(() => {});
+      return;
+    }
+
+    if (outputTokensToUse < input.requestedMaxOutputTokens) {
+      await input.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "warn",
+          phase: "synthesize",
+          eventType: "synthesis_output_cap_applied",
+          message: "Synthesis output token budget was reduced to fit context constraints",
+          data: {
+            requestedInputBudget: input.requestedMaxInputTokens,
+            requestedOutputTokens: input.requestedMaxOutputTokens,
+            outputTokensApplied: outputTokensToUse,
+            outputCapFromContext,
+            contextWindowTokens: input.synthesisContextWindowTokens,
+            inputTokensAfter: trimResult.inputTokensAfter,
+            sourceCountBefore: trimResult.sourceCountBefore,
+            sourceCountAfter: trimResult.sourceCountAfter,
+            sourceCountCap,
+            quoteCountCap,
+          },
+        })
+        .catch(() => {});
+    }
+  };
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const trimResult = trimSynthesisContextForBudget({
@@ -6317,6 +6613,7 @@ async function synthesizeMarkdownPhase(input: {
       )
     );
     const outputTokensToUse = Math.min(input.maxOutputTokens, outputCapFromContext);
+    await logOutputCapEvent(trimResult, outputCapFromContext, outputTokensToUse);
 
     const writerPayload = buildSynthesisMarkdownPromptPayload({
       prompt: input.prompt,
@@ -6329,9 +6626,9 @@ async function synthesizeMarkdownPhase(input: {
       targets,
       refinementPass: attempt,
     });
-    const revisionHints = reviewDirectives.length
-      ? `\n\nReviewer directives for this pass:\n- ${reviewDirectives.join("\n- ")}`
-      : "";
+    const writerPayloadWithDirectives = reviewDirectives.length
+      ? { ...writerPayload, reviewDirectives }
+      : writerPayload;
 
     const markdownDraft = await callModelTextLogged({
       runId: input.runId,
@@ -6345,7 +6642,7 @@ async function synthesizeMarkdownPhase(input: {
         { role: "system", content: SYNTHESIS_MARKDOWN_WRITER_PROMPT },
         {
           role: "user",
-          content: `${JSON.stringify(writerPayload)}${revisionHints}`,
+          content: JSON.stringify(writerPayloadWithDirectives),
         },
       ],
       maxTokens: outputTokensToUse,
@@ -6355,9 +6652,44 @@ async function synthesizeMarkdownPhase(input: {
       checkpoint: input.checkpoint,
       promptVersion: "synthesize.markdown.v1",
     });
+    const coercedDraft = maybeCoerceStructuredDraftToMarkdown({
+      draft: markdownDraft,
+      sources: trimResult.sourceBriefs,
+    });
+    const markdownDraftForReview = coercedDraft?.markdown ?? markdownDraft;
+    if (coercedDraft) {
+      await input.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "synthesize",
+          eventType: "synthesis_writing_output_coerced",
+          message: "Structured synthesis output was coerced to markdown draft",
+          data: {
+            mode: coercedDraft.mode,
+          },
+        })
+        .catch(() => {});
+    }
 
-    lastMarkdownDraft = markdownDraft;
-    if (!reviewEnabled) return markdownDraft;
+    lastMarkdownDraft = markdownDraftForReview;
+    if (!reviewEnabled) return markdownDraftForReview;
+
+    await input.store
+      .addRunEvent({
+        runId: input.runId,
+        level: "info",
+        phase: "synthesize",
+        eventType: "synthesis_review_requested",
+        message: "Reviewing markdown draft before finalizing synthesis",
+        data: {
+          attempt: attempt + 1,
+          attemptsAllowed: attempts,
+          sourceCountCap,
+          quoteCountCap,
+        },
+      })
+      .catch(() => {});
 
     const review = await reviewSynthesisMarkdownDraft({
       runId: input.runId,
@@ -6365,7 +6697,7 @@ async function synthesizeMarkdownPhase(input: {
       prompt: input.prompt,
       sources: trimResult.sourceBriefs,
       sourceAbstracts: trimResult.sourceAbstracts,
-      draftMarkdown: markdownDraft,
+      draftMarkdown: markdownDraftForReview,
       provider: input.provider,
       model: input.model,
       thinkingMode: input.thinkingMode,
@@ -6396,7 +6728,26 @@ async function synthesizeMarkdownPhase(input: {
       })
       .catch(() => {});
 
-    if (review.verdict === "accept") return markdownDraft;
+    if (review.verdict === "accept") {
+      if (attempt > 0) {
+        await input.store
+          .addRunEvent({
+            runId: input.runId,
+            level: "info",
+            phase: "synthesize",
+            eventType: "synthesis_refinement_succeeded",
+            message: "Reviewer accepted a refined markdown draft",
+            data: {
+              attemptsUsed: attempt + 1,
+              attemptsAllowed: attempts,
+              sourceCountCap,
+              quoteCountCap,
+            },
+          })
+          .catch(() => {});
+      }
+      return markdownDraftForReview;
+    }
 
     if (review.verdict === "revise" || review.verdict === "reject") {
       if (unsupportedConclusions.length > 0) {
