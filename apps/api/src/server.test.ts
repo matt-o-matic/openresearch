@@ -119,6 +119,91 @@ describe("API resume", () => {
     expect(await countJobs(run.id)).toBe(1);
   });
 
+  it("keeps running local-cli runs in-place when execution pid is alive", async () => {
+    const user = await store!.createUser({ role: "user" });
+    const { apiKey } = await store!.createApiKey({ userId: user.id });
+
+    const run = await store!.createRun({ userId: user.id, prompt: "test prompt" });
+    await store!.updateRun({
+      runId: run.id,
+      status: "running",
+      phase: "retrieve",
+      state: {
+        version: 1,
+        nextPhase: "retrieve",
+        counters: { searchCalls: 0, fetches: 0, renders: 0, modelCalls: 0 },
+        artifacts: {},
+        debug: { enabled: false },
+        execution: {
+          owner: "cli-local",
+          pid: process.pid,
+          hostname: os.hostname(),
+          startedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    expect(await countJobs(run.id)).toBe(0);
+
+    const res = await app!.inject({
+      method: "POST",
+      url: `/runs/${run.id}/resume`,
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; status: string; jobId: string | null };
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe("running");
+    expect(body.jobId).toBeNull();
+    expect(await countJobs(run.id)).toBe(0);
+  });
+
+  it("reconciles dead local-cli pid and enqueues resume job", async () => {
+    const user = await store!.createUser({ role: "user" });
+    const { apiKey } = await store!.createApiKey({ userId: user.id });
+
+    const run = await store!.createRun({ userId: user.id, prompt: "test prompt" });
+    await store!.updateRun({
+      runId: run.id,
+      status: "running",
+      phase: "retrieve",
+      state: {
+        version: 1,
+        nextPhase: "retrieve",
+        counters: { searchCalls: 0, fetches: 0, renders: 0, modelCalls: 0 },
+        artifacts: {},
+        debug: { enabled: false },
+        execution: {
+          owner: "cli-local",
+          pid: 9999999,
+          hostname: os.hostname(),
+          startedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    expect(await countJobs(run.id)).toBe(0);
+
+    const res = await app!.inject({
+      method: "POST",
+      url: `/runs/${run.id}/resume`,
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { ok: boolean; jobId: string };
+    expect(body.ok).toBe(true);
+    expect(typeof body.jobId).toBe("string");
+    expect(await countJobs(run.id)).toBe(1);
+
+    const updated = await store!.getRun(run.id);
+    expect(updated?.status).toBe("queued");
+
+    const events = await store!.listRunEvents(run.id, { limit: 50 });
+    expect(events.some((event) => event.event_type === "run_orphaned_reconciled")).toBe(true);
+  });
+
   it("restores from latest checkpoint and enqueues exactly one job", async () => {
     const user = await store!.createUser({ role: "user" });
     const { apiKey } = await store!.createApiKey({ userId: user.id });

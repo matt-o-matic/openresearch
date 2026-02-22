@@ -87,7 +87,7 @@ describe("loadConfig", () => {
       });
       expect(config.policies.qualityProfiles.full.synthesis).toMatchObject({
         maxInputTokens: 1_000_000,
-        maxOutputTokens: 500_000,
+        maxOutputTokens: 32_000,
       });
       expect(config.policies.qualityProfiles.full.researchLoop).toMatchObject({
         enabled: true,
@@ -101,7 +101,7 @@ describe("loadConfig", () => {
       });
       expect(config.policies.qualityProfiles.degraded.synthesis).toMatchObject({
         maxInputTokens: 1_000_000,
-        maxOutputTokens: 500_000,
+        maxOutputTokens: 32_000,
       });
       expect(config.policies.qualityProfiles.degraded.researchLoop).toMatchObject({
         enabled: true,

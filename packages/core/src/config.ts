@@ -64,12 +64,33 @@ export type AgenticLoopConfig = z.infer<typeof AgenticLoopConfigSchema>;
 
 export const SynthesisConfigSchema = z.object({
   maxInputTokens: z.number().int().positive().default(1_000_000),
-  maxOutputTokens: z.number().int().positive().default(500_000),
+  maxOutputTokens: z.number().int().positive().default(32_000),
 });
 export type SynthesisConfig = z.infer<typeof SynthesisConfigSchema>;
 
 export const ResearchLoopModeSchema = z.enum(["auto", "incremental", "hybrid"]).default("auto");
 export type ResearchLoopMode = z.infer<typeof ResearchLoopModeSchema>;
+
+export const QuestionGraphDependencyInferenceModeSchema = z
+  .enum(["conservative", "moderate", "aggressive"])
+  .default("moderate");
+export type QuestionGraphDependencyInferenceMode = z.infer<
+  typeof QuestionGraphDependencyInferenceModeSchema
+>;
+
+export const QuestionGraphPruneStrategySchema = z
+  .enum(["transitive_reduction", "flatten"])
+  .default("transitive_reduction");
+export type QuestionGraphPruneStrategy = z.infer<typeof QuestionGraphPruneStrategySchema>;
+
+export const QuestionGraphConfigSchema = z
+  .object({
+    dependencyInferenceMode: QuestionGraphDependencyInferenceModeSchema,
+    pruneStrategy: QuestionGraphPruneStrategySchema,
+    maxDepth: z.number().int().positive().default(4),
+  })
+  .default({});
+export type QuestionGraphConfig = z.infer<typeof QuestionGraphConfigSchema>;
 
 export const ResearchLoopConfigSchema = z
   .object({
@@ -78,6 +99,7 @@ export const ResearchLoopConfigSchema = z
     sourcesPerIteration: z.number().int().positive().optional(),
     mode: ResearchLoopModeSchema,
     switchToHybridAfterRejects: z.number().int().positive().default(2),
+    dynamicOutlineEnabled: z.boolean().default(true),
     fullContext: z.boolean().optional(),
   })
   .default({});
@@ -92,6 +114,7 @@ export const QualityProfileSchema = z.object({
   agenticLoop: AgenticLoopConfigSchema.default({}),
   synthesis: SynthesisConfigSchema.default({}),
   researchLoop: ResearchLoopConfigSchema,
+  questionGraph: QuestionGraphConfigSchema.optional(),
   enablePlaywright: z.boolean().default(true),
 });
 export type QualityProfile = z.infer<typeof QualityProfileSchema>;
@@ -144,6 +167,7 @@ export const OpenResearchConfigSchema = z.object({
       baseUrl: z.string().min(1).default("https://openrouter.ai/api/v1"),
       appName: z.string().min(1).default("openresearch"),
       appUrl: z.string().min(1).optional(),
+      requestTimeoutMs: z.number().int().positive().optional(),
     })
     .default({}),
   search: z
@@ -195,7 +219,12 @@ export const OpenResearchConfigSchema = z.object({
             },
             synthesis: {
               maxInputTokens: 1_000_000,
-              maxOutputTokens: 500_000,
+              maxOutputTokens: 32_000,
+            },
+            questionGraph: {
+              dependencyInferenceMode: "moderate",
+              pruneStrategy: "transitive_reduction",
+              maxDepth: 4,
             },
           }),
           degraded: QualityProfileSchema.default({
@@ -223,7 +252,12 @@ export const OpenResearchConfigSchema = z.object({
             },
             synthesis: {
               maxInputTokens: 1_000_000,
-              maxOutputTokens: 500_000,
+              maxOutputTokens: 32_000,
+            },
+            questionGraph: {
+              dependencyInferenceMode: "moderate",
+              pruneStrategy: "transitive_reduction",
+              maxDepth: 4,
             },
           }),
         })

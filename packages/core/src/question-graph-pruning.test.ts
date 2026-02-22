@@ -226,7 +226,7 @@ class QuestionGraphModelProvider implements ModelProvider {
 }
 
 describe("question graph dependency pruning", () => {
-  it("prunes overspecified dependencies when no strong cues are present", async () => {
+  it("transitively prunes overspecified dependencies without flattening the DAG", async () => {
     const runId = "run-question-graph-prune";
     const userId = "user";
     const prompt = "What are the most recent public guidelines on solar panel efficiency?";
@@ -265,8 +265,8 @@ describe("question graph dependency pruning", () => {
       questions: [
         { text: "What does DOE say?", dependsOn: [] },
         { text: "What does IEA say?", dependsOn: ["q1"] },
-        { text: "What does the EU say?", dependsOn: ["q2"] },
-        { text: "What are common metrics?", dependsOn: ["q3"] },
+        { text: "What does the EU say?", dependsOn: ["q1", "q2"] },
+        { text: "What are common metrics?", dependsOn: ["q1", "q2", "q3"] },
       ],
     });
 
@@ -284,13 +284,18 @@ describe("question graph dependency pruning", () => {
       },
     });
 
-    expect(store.events.some((e) => e.eventType === "question_graph_dependencies_pruned")).toBe(
-      true
-    );
+    expect(store.events.some((e) => e.eventType === "question_graph_diagnostics")).toBe(true);
+    expect(store.events.some((e) => e.eventType === "question_graph_dependencies_pruned")).toBe(false);
 
     const graph = await objectStore.getJson<QuestionGraph>(runArtifactKey(runId, "question-graph.json"));
     expect(graph).not.toBeNull();
-    expect(graph?.questions.every((q) => q.dependsOn.length === 0)).toBe(true);
+    expect(graph?.questions[1]?.dependsOn).toEqual(["q1"]);
+    expect(graph?.questions[2]?.dependsOn).toEqual(["q2"]);
+    expect(graph?.questions[3]?.dependsOn).toEqual(["q3"]);
+    const diagnostics = await objectStore.getJson<{
+      prunedEdges: Array<{ from: string; to: string; reason: string }>;
+    }>(runArtifactKey(runId, "question-graph-diagnostics.json"));
+    expect((diagnostics?.prunedEdges.length ?? 0) > 0).toBe(true);
   });
 
   it("keeps dependencies when strong dependency cues are present", async () => {
@@ -358,5 +363,77 @@ describe("question graph dependency pruning", () => {
     expect(graph).not.toBeNull();
     expect(graph?.questions.some((q) => q.dependsOn.length > 0)).toBe(true);
   });
-});
 
+  it("infers dependency chains from flat question output with sequence cues", async () => {
+    const runId = "run-question-graph-infer";
+    const userId = "user";
+    const prompt = "Research TechR2 and Meta overlap, then identify contacts and draft outreach.";
+    const objectStore = new MemoryObjectStore();
+    const checkpoint: RunCheckpoint = {
+      version: 1,
+      nextPhase: "plan",
+      counters: { searchCalls: 0, fetches: 0, renders: 0, modelCalls: 0 },
+      artifacts: {},
+      debug: { enabled: false },
+    };
+
+    const store = new MemoryPipelineStore({
+      runId,
+      userId,
+      prompt,
+      budgets: {
+        maxRuntimeMs: 30_000,
+        maxSources: 0,
+        maxFetches: 0,
+        maxBrowserRenders: 0,
+        fetchConcurrency: 1,
+        extractConcurrency: 1,
+      },
+      modelConfig: {
+        planner: "mock/planner",
+        synthesizer: "mock/synth",
+        verifier: "mock/verify",
+        verifierStrong: "mock/verify-strong",
+      },
+      adapterConfig: { researchLoop: { enabled: false } },
+      checkpoint,
+    });
+
+    const modelProvider = new QuestionGraphModelProvider({
+      questions: [
+        { text: "Find out what TechR2 does", dependsOn: [] },
+        { text: "Find out what Meta needs", dependsOn: [] },
+        { text: "Identify overlaps", dependsOn: [] },
+        { text: "Find people at Meta who care", dependsOn: [] },
+        { text: "Draft emails to each person", dependsOn: [] },
+      ],
+    });
+
+    const config = OpenResearchConfigSchema.parse({ env: "test" });
+
+    await runResearchPipeline({
+      runId,
+      config,
+      services: {
+        store,
+        objectStore,
+        search: { name: "mock-search", async search() { return []; } },
+        httpFetch: { name: "mock-http", async fetch(url: string) { return { ok: false as const, url, status: null, error: "not used" }; } },
+        modelProvider,
+      },
+    });
+
+    const graph = await objectStore.getJson<QuestionGraph>(runArtifactKey(runId, "question-graph.json"));
+    expect(graph).not.toBeNull();
+    expect(graph?.questions[0]?.dependsOn).toEqual([]);
+    expect(graph?.questions[1]?.dependsOn).toEqual([]);
+    expect(graph?.questions[2]?.dependsOn).toEqual(["q1", "q2"]);
+    expect(graph?.questions[3]?.dependsOn).toEqual(["q3"]);
+    expect(graph?.questions[4]?.dependsOn).toEqual(["q4"]);
+    expect(store.events.some((e) => e.eventType === "question_graph_diagnostics")).toBe(true);
+    const diagnostics = await objectStore.getJson<{
+      inferredEdges: Array<{ from: string; to: string; reason: string }>;
+    }>(runArtifactKey(runId, "question-graph-diagnostics.json"));
+    expect((diagnostics?.inferredEdges.length ?? 0) > 0).toBe(true);
+  });
+});

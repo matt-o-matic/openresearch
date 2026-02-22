@@ -52,6 +52,14 @@ export function runPlanKey(runId: string): string {
   return runArtifactKey(runId, "plan.json");
 }
 
+export function runOutlinePlanKey(runId: string): string {
+  return runArtifactKey(runId, "outline-plan.json");
+}
+
+export function runReportPlanKey(runId: string): string {
+  return runArtifactKey(runId, "report-plan.json");
+}
+
 export function runSynthesisKey(runId: string): string {
   return runArtifactKey(runId, "synthesis.json");
 }
@@ -74,12 +82,20 @@ export function iterationPlanKey(runId: string, iteration: number): string {
   return iterationArtifactKey(runId, iteration, "plan.json");
 }
 
+export function iterationOutlinePlanKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "outline-plan.json");
+}
+
 export function iterationRetrievalKey(runId: string, iteration: number): string {
   return iterationArtifactKey(runId, iteration, "retrieval.json");
 }
 
 export function iterationSynthesisKey(runId: string, iteration: number): string {
   return iterationArtifactKey(runId, iteration, "synthesis.json");
+}
+
+export function iterationCompressionKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "compression.json");
 }
 
 export function iterationCitationMapKey(runId: string, iteration: number): string {
@@ -100,6 +116,10 @@ export function iterationReviewKey(runId: string, iteration: number): string {
 
 export function iterationGapAnalysisKey(runId: string, iteration: number): string {
   return iterationArtifactKey(runId, iteration, "gap-analysis.json");
+}
+
+export function iterationGapDiagnosticsKey(runId: string, iteration: number): string {
+  return iterationArtifactKey(runId, iteration, "gap-analysis-diagnostics.json");
 }
 
 export function debugSourceRenderedHtmlKey(runId: string, sourceId: string): string {

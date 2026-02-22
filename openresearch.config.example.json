@@ -29,7 +29,8 @@
     "apiKey": "env:OPENROUTER_API_KEY",
     "baseUrl": "https://openrouter.ai/api/v1",
     "appName": "openresearch",
-    "appUrl": "https://example.com"
+    "appUrl": "https://example.com",
+    "requestTimeoutMs": 120000
   },
   "search": {
     "backend": "searxng",
@@ -91,13 +92,19 @@
         },
         "synthesis": {
           "maxInputTokens": 1000000,
-          "maxOutputTokens": 500000
+          "maxOutputTokens": 32000
         },
         "researchLoop": {
           "enabled": true,
           "maxIterations": 5,
           "mode": "auto",
-          "switchToHybridAfterRejects": 2
+          "switchToHybridAfterRejects": 2,
+          "dynamicOutlineEnabled": true
+        },
+        "questionGraph": {
+          "dependencyInferenceMode": "moderate",
+          "pruneStrategy": "transitive_reduction",
+          "maxDepth": 4
         }
       },
       "degraded": {
@@ -125,13 +132,19 @@
         },
         "synthesis": {
           "maxInputTokens": 1000000,
-          "maxOutputTokens": 500000
+          "maxOutputTokens": 32000
         },
         "researchLoop": {
           "enabled": true,
           "maxIterations": 5,
           "mode": "auto",
-          "switchToHybridAfterRejects": 2
+          "switchToHybridAfterRejects": 2,
+          "dynamicOutlineEnabled": true
+        },
+        "questionGraph": {
+          "dependencyInferenceMode": "moderate",
+          "pruneStrategy": "transitive_reduction",
+          "maxDepth": 4
         }
       }
     }

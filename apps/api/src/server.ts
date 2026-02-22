@@ -1,3 +1,4 @@
+import os from "node:os";
 import type { OpenResearchConfig, UsageSnapshot, UserPolicy } from "@openresearch/core";
 import { restoreRunStateFromLatestCheckpoint, selectQualityForUser, UserPolicySchema } from "@openresearch/core";
 import type {
@@ -69,6 +70,42 @@ function filterArtifacts(
   if (admin) return items;
   const prefix = `runs/${runId}/debug/`;
   return items.filter((i) => !i.key.startsWith(prefix));
+}
+
+type ExecutionMetadata = {
+  owner: "cli-local" | "worker";
+  pid?: number;
+  hostname?: string;
+  jobId?: string;
+  startedAt?: string;
+};
+
+function parseExecutionMetadata(state: unknown): ExecutionMetadata | null {
+  if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+  const execution = (state as { execution?: unknown }).execution;
+  if (!execution || typeof execution !== "object" || Array.isArray(execution)) return null;
+  const o = execution as Record<string, unknown>;
+  const owner = o.owner === "cli-local" || o.owner === "worker" ? o.owner : null;
+  if (!owner) return null;
+
+  const metadata: ExecutionMetadata = { owner };
+  if (typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0) metadata.pid = o.pid;
+  if (typeof o.hostname === "string" && o.hostname.trim().length > 0) metadata.hostname = o.hostname.trim();
+  if (typeof o.jobId === "string" && o.jobId.trim().length > 0) metadata.jobId = o.jobId.trim();
+  if (typeof o.startedAt === "string" && o.startedAt.trim().length > 0) metadata.startedAt = o.startedAt.trim();
+  return metadata;
+}
+
+function isPidAlive(pid: number): boolean | "unknown" {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    return "unknown";
+  }
 }
 
 function rateLimiter() {
@@ -220,7 +257,7 @@ export async function buildApiServer(input: {
   app.post("/runs/:runId/resume", async (req, reply) => {
     const auth = req.auth!;
     const runId = RunIdParamsSchema.parse(req.params).runId;
-    const run = await input.store.getRun(runId);
+    let run = await input.store.getRun(runId);
     if (!run) return reply.code(404).send({ error: "not_found" });
     if (!isAdmin(req) && run.user_id !== auth.user.id)
       return reply.code(403).send({ error: "forbidden" });
@@ -231,6 +268,53 @@ export async function buildApiServer(input: {
       (existingJob.status === "queued" ||
         existingJob.status === "leased" ||
         existingJob.status === "running");
+
+    let autoReconciledOrphan = false;
+    if (run.status === "running" && !jobActive) {
+      const execution = parseExecutionMetadata(run.state);
+      const currentHost = os.hostname().toLowerCase();
+      const sameHost =
+        typeof execution?.hostname === "string" &&
+        execution.hostname.toLowerCase() === currentHost;
+      const hasPid = typeof execution?.pid === "number" && Number.isInteger(execution.pid) && execution.pid > 0;
+
+      if (execution?.owner === "cli-local" && sameHost && hasPid) {
+        const pidAlive = isPidAlive(execution.pid!);
+        if (pidAlive === false) {
+          await input.store.updateRun({ runId, status: "canceled", finishedAt: new Date() });
+          await input.store.addRunEvent({
+            runId,
+            level: "warn",
+            eventType: "run_orphaned_reconciled",
+            message: "Reconciled orphaned local run before resume",
+            data: {
+              owner: execution.owner,
+              pid: execution.pid,
+              hostname: execution.hostname,
+            },
+          });
+          const refreshed = await input.store.getRun(runId);
+          if (refreshed) run = refreshed;
+          autoReconciledOrphan = true;
+        } else {
+          return reply.send({
+            ok: true,
+            runId,
+            status: run.status,
+            phase: run.phase,
+            jobId: existingJob?.id ?? null,
+          });
+        }
+      } else {
+        return reply.send({
+          ok: true,
+          runId,
+          status: run.status,
+          phase: run.phase,
+          jobId: existingJob?.id ?? null,
+        });
+      }
+    }
 
     if (run.status === "queued" || run.status === "running" || jobActive) {
       return reply.send({
@@ -252,7 +336,7 @@ export async function buildApiServer(input: {
       });
     }
 
-    if (run.status === "canceled") {
+    if (run.status === "canceled" && !autoReconciledOrphan) {
       return reply.code(409).send({ error: "canceled" });
     }
 

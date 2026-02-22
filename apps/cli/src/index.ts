@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import os from "node:os";
 import { format } from "node:util";
 
 import {
@@ -87,12 +88,21 @@ async function buildServices(config: Awaited<ReturnType<typeof loadConfig>>) {
   const modelProvider = config.openRouter.apiKey
     ? new OpenRouterModelProvider(
         (() => {
-          const out: { apiKey: string; baseUrl?: string; appName?: string; appUrl?: string } = {
+          const out: {
+            apiKey: string;
+            baseUrl?: string;
+            appName?: string;
+            appUrl?: string;
+            requestTimeoutMs?: number;
+          } = {
             apiKey: config.openRouter.apiKey,
             baseUrl: config.openRouter.baseUrl,
             appName: config.openRouter.appName,
           };
           if (config.openRouter.appUrl) out.appUrl = config.openRouter.appUrl;
+          if (config.openRouter.requestTimeoutMs !== undefined) {
+            out.requestTimeoutMs = config.openRouter.requestTimeoutMs;
+          }
           return out;
         })()
       )
@@ -445,6 +455,14 @@ function eventLabel(event: DbRunEvent): string {
   if (event.message) return event.message;
 
   switch (event.event_type) {
+    case "question_graph_diagnostics":
+      return "Question graph diagnostics updated";
+    case "outline_plan_updated":
+      return `Dynamic outline updated for iteration ${String(normalizeCount(data?.iteration) || "unknown")}`;
+    case "finalize.dynamic_outline_used":
+      return data?.used === true
+        ? "Finalize rendered dynamic outline"
+        : "Finalize rendered legacy fixed headings";
     case "search_result_candidate":
       return `Candidate source: ${safeString(data?.url)}`;
     case "source_fetch_started":
@@ -889,6 +907,9 @@ program
       const { store, objectStore, services } = await buildServices(config);
       let commandError: unknown = null;
       let pipelineLogWriter: RunLogWriter | null = null;
+      let removeSignalHandlers: (() => void) | null = null;
+      let cancelRequested = false;
+      let runStart = Date.now();
       try {
         const users = await store.listUsers();
         const admin =
@@ -925,15 +946,40 @@ program
         });
         if (verbosity >= 1) pipelineLogWriter.log(`Run ID: ${run.id}`);
 
+        runStart = Date.now();
+        const requestCancel = (signal: NodeJS.Signals) => {
+          if (cancelRequested) return;
+          cancelRequested = true;
+          if (verbosity >= 1) {
+            pipelineLogWriter?.log(
+              `[${formatElapsed(runStart)}] ${signal} received; canceling at the next phase boundary`
+            );
+          }
+        };
+        const onSigint = () => requestCancel("SIGINT");
+        const onSigterm = () => requestCancel("SIGTERM");
+        process.once("SIGINT", onSigint);
+        process.once("SIGTERM", onSigterm);
+        removeSignalHandlers = () => {
+          process.off("SIGINT", onSigint);
+          process.off("SIGTERM", onSigterm);
+        };
+
         const pipelineInput: Parameters<typeof runResearchPipeline>[0] = {
           runId: run.id,
           config,
           services,
+          shouldCancel: async () => cancelRequested,
+          executionContext: {
+            owner: "cli-local",
+            pid: process.pid,
+            hostname: os.hostname(),
+            startedAt: new Date(runStart).toISOString(),
+          },
         };
         if (opts.debugCapture)
           pipelineInput.debugCapture = { enabled: true, reason: "cli --debug-capture" };
 
-        const runStart = Date.now();
         await Promise.all(
           [
             runResearchPipeline(pipelineInput),
@@ -1088,6 +1134,7 @@ program
       } catch (error) {
         commandError = error;
       }
+      if (removeSignalHandlers) removeSignalHandlers();
       if (pipelineLogWriter) {
         await pipelineLogWriter.flush();
       }
@@ -1111,7 +1158,17 @@ program
     if (opts.local) {
       const { store, services } = await buildServices(config);
       try {
-        await runResearchPipeline({ runId, config, services });
+        await runResearchPipeline({
+          runId,
+          config,
+          services,
+          executionContext: {
+            owner: "cli-local",
+            pid: process.pid,
+            hostname: os.hostname(),
+            startedAt: new Date().toISOString(),
+          },
+        });
         console.log(`Resumed locally: ${runId}`);
       } finally {
         await store.close();

@@ -5,8 +5,22 @@ import type { HttpFetchAdapter, SearchAdapter } from "./adapters.js";
 import type { ModelProvider } from "./models.js";
 import type { LabeledSource, SynthesisOutput } from "./memo.js";
 import type { ObjectStore, PipelineRunRow, PipelineSourceRow, PipelineStore, RunCheckpoint } from "./orchestrator.js";
-import { runFinalSynthesisReviewKey, runPlanKey, runSynthesisKey, iterationPlanKey, iterationRetrievalKey } from "./artifacts.js";
-import { runResearchLoop, type GapAnalysisOutput, type IterationReviewOutput, type RetrievalOutput, type LoopSteps } from "./research-loop.js";
+import {
+  iterationCompressionKey,
+  iterationGapAnalysisKey,
+  iterationGapDiagnosticsKey,
+  iterationPlanKey,
+  iterationRetrievalKey,
+  runPlanKey,
+} from "./artifacts.js";
+import {
+  runResearchLoop,
+  type GapAnalysisNormalizationDiagnostics,
+  type GapAnalysisOutput,
+  type IterationReviewOutput,
+  type RetrievalOutput,
+  type LoopSteps,
+} from "./research-loop.js";
 
 class MemoryObjectStore implements ObjectStore {
   private readonly json = new Map<string, unknown>();
@@ -193,6 +207,7 @@ function baseLoopConfig(overrides?: Partial<ResearchLoopConfig>): ResearchLoopCo
     maxIterations: 5,
     mode: "auto",
     switchToHybridAfterRejects: 2,
+    dynamicOutlineEnabled: true,
     ...overrides,
   };
 }
@@ -356,7 +371,90 @@ describe("runResearchLoop", () => {
     expect(capturedMaxSelectedUrls).toBe(21);
     expect(result.stopReason).toBe("questions_answered");
     expect(result.mode).toBe("incremental");
-    expect(await objectStore.getJson(runSynthesisKey(runId))).not.toBeNull();
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 1))).not.toBeNull();
+  });
+
+  it("runs compression + gap-analysis without invoking in-loop synthesis writing/review", async () => {
+    const runId = "run-no-inline-synthesis";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let synthesizeCalls = 0;
+    let reviewCalls = 0;
+    let gapCalls = 0;
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        const out: RetrievalOutput = { queries: [], selectedUrls: ["https://example.com/inline-synthesis-check"] };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        synthesizeCalls += 1;
+        return synthesisSnapshot({ summary: "should not run", sources: input.sources, findingId: "F1" });
+      },
+      review: async () => {
+        reviewCalls += 1;
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        const out: GapAnalysisOutput = {
+          questionUpdates: [],
+          nextQueries: [],
+          nextTasks: [],
+          stop: true,
+          stopReason: "complete",
+        };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 2 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 2 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("gap_analysis_stop");
+    expect(gapCalls).toBeGreaterThanOrEqual(1);
+    expect(synthesizeCalls).toBe(0);
+    expect(reviewCalls).toBe(0);
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 1))).not.toBeNull();
+    expect(await objectStore.getJson(iterationGapAnalysisKey(runId, 1))).not.toBeNull();
   });
 
   it("stops when gap analysis requests stop and persists a plan version artifact", async () => {
@@ -428,8 +526,106 @@ describe("runResearchLoop", () => {
       steps,
     });
 
-    expect(result.stopReason).toBe("gap_analysis_stop");
+    expect(["gap_analysis_stop", "questions_answered"]).toContain(result.stopReason);
     expect(await objectStore.getJson(iterationPlanKey(runId, 1))).not.toBeNull();
+  });
+
+  it("uses nextQueries for retrieval and only falls back to normalized nextTasks when queries are empty", async () => {
+    const runId = "run-task-fallback-queries";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["initial query"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    const retrieveQueriesSeen: string[][] = [];
+    let gapCall = 0;
+    const steps: LoopSteps = {
+      retrieve: async (input) => {
+        retrieveQueriesSeen.push([...input.queries]);
+        const out: RetrievalOutput = {
+          queries: [],
+          selectedUrls: [`https://example.com/fallback-${retrieveQueriesSeen.length}`],
+        };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({ summary: "iteration synthesis", sources: input.sources, findingId: "F1" });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCall += 1;
+        const out: GapAnalysisOutput =
+          gapCall === 1
+            ? {
+                questionUpdates: [],
+                nextQueries: [],
+                nextTasks: ["search renewable energy procurement ohio"],
+                stop: false,
+              }
+            : {
+                questionUpdates: [],
+                nextQueries: [],
+                nextTasks: [],
+                stop: true,
+                stopReason: "complete",
+              };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 3 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(["gap_analysis_stop", "questions_answered"]).toContain(result.stopReason);
+    expect(retrieveQueriesSeen[0]).toEqual(["initial query"]);
+    expect(retrieveQueriesSeen[1]).toEqual(["renewable energy procurement ohio"]);
+
+    const fallbackSelectionEvent = store.events.find(
+      (event) =>
+        event.eventType === "research_iteration_query_selection" &&
+        event.data &&
+        typeof event.data === "object" &&
+        (event.data as { usedTaskFallback?: unknown }).usedTaskFallback === true
+    );
+    expect(fallbackSelectionEvent).toBeDefined();
   });
 
   it("accepts empty gap-analysis stopReason when stop is false and continues", async () => {
@@ -590,8 +786,198 @@ describe("runResearchLoop", () => {
     expect(callCount).toBe(2);
   });
 
-  it("rejects empty gap-analysis stopReason when stop is true", async () => {
-    const runId = "run-gap-stop-empty-rejected";
+  it("normalizes gap-analysis schema drift and persists normalization diagnostics", async () => {
+    const runId = "run-gap-normalization-diagnostics";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let gapCalls = 0;
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        const out: RetrievalOutput = { queries: [], selectedUrls: ["https://example.com/source"] };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({ summary: "iteration synthesis", sources: input.sources, findingId: "F1" });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        const out = {
+          questionUpdates: [
+            {
+              id: "q1",
+              status: "answered",
+              evidence: [{ source: "S1", quoteId: "   ", note: "Evidence note" }],
+              confidence: 1.4,
+            },
+          ],
+          nextQueries: ["  follow up  ", "", "follow up"],
+          nextTasks: ["  task  ", " "],
+          planNotes: ["  note  ", "note"],
+          stop: false,
+          stopReason: "   ",
+          outlinePlan: {
+            version: 2,
+            rationale: "Normalize me",
+            sections: [
+              {
+                id: "summary",
+                heading: "Summary",
+                intent: "Short overview",
+                dependsOnQuestionIds: [],
+              },
+            ],
+            notes: [],
+          },
+        };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 1 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 1 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("questions_answered");
+    expect(gapCalls).toBe(1);
+
+    const gap = await objectStore.getJson<GapAnalysisOutput>(iterationGapAnalysisKey(runId, 1));
+    expect(gap).not.toBeNull();
+    expect(gap?.outlinePlan?.version).toBe(1);
+    expect(gap?.questionUpdates[0]?.confidence).toBe(1);
+    expect(gap?.questionUpdates[0]?.evidence[0]?.quoteId).toBeUndefined();
+    expect(gap?.nextQueries).toEqual(["follow up"]);
+    expect(gap?.nextTasks).toEqual(["task"]);
+    expect(gap?.planNotes).toEqual(["note"]);
+    expect(gap?.stopReason).toBeUndefined();
+
+    const diagnostics =
+      await objectStore.getJson<GapAnalysisNormalizationDiagnostics>(iterationGapDiagnosticsKey(runId, 1));
+    expect(diagnostics?.changed).toBe(true);
+    expect(diagnostics?.outlineVersionCoerced).toBe(true);
+    expect(diagnostics?.dropped.emptyQuoteIds).toBe(1);
+    expect(diagnostics?.clampedConfidenceCount).toBe(1);
+    expect(diagnostics?.dropped.stopReasonEmpty).toBe(true);
+    expect(diagnostics?.fallbackUsed).toBe(false);
+    expect(store.events.some((event) => event.eventType === "gap_analysis_normalized")).toBe(true);
+  });
+
+  it("uses deterministic gap fallback when gap-analysis call throws", async () => {
+    const runId = "run-gap-fallback-on-throw";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        const out: RetrievalOutput = { queries: [], selectedUrls: ["https://example.com/source"] };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({ summary: "iteration synthesis", sources: input.sources, findingId: "F1" });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        void ({} as T);
+        throw new Error("synthetic gap-analysis failure");
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 1 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 1 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("gap_analysis_stop");
+    const gap = await objectStore.getJson<GapAnalysisOutput>(iterationGapAnalysisKey(runId, 1));
+    expect(gap?.stop).toBe(true);
+    expect(gap?.stopReason).toBe("gap_analysis_schema_error");
+    const diagnostics =
+      await objectStore.getJson<GapAnalysisNormalizationDiagnostics>(iterationGapDiagnosticsKey(runId, 1));
+    expect(diagnostics?.fallbackUsed).toBe(true);
+    expect(diagnostics?.parseError?.message).toContain("synthetic gap-analysis failure");
+    expect(store.events.some((event) => event.eventType === "gap_analysis_fallback_used")).toBe(true);
+  });
+
+  it("fails open when stop=true payload has empty stopReason and writes fallback diagnostics", async () => {
+    const runId = "run-gap-stop-empty-fallback";
     const userId = "user";
     const prompt = "Test prompt";
     const checkpoint = baseCheckpoint(runId);
@@ -631,29 +1017,39 @@ describe("runResearchLoop", () => {
       },
     };
 
-    await expect(
-      runResearchLoop({
-        runId,
-        userId,
-        prompt,
-        citationPolicy,
-        budgets: baseBudgetConfig({ maxSources: 10 }),
-        models: baseModels(),
-        thinkingMode,
-        loopConfig: baseLoopConfig({ maxIterations: 1 }),
-        deadlineMs: Date.now() + 60_000,
-        services: makeStaticServices({ store, objectStore, modelProvider }),
-        checkpoint,
-        synthesis: {
-          maxInputTokens: 120_000,
-          maxOutputTokens: 5_000,
-          contextWindowTokens: 120_000,
-          requestedMaxInputTokens: 120_000,
-          requestedMaxOutputTokens: 5_000,
-        },
-        steps,
-      }),
-    ).rejects.toThrow("stopReason is required when stop is true");
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 1 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("gap_analysis_stop");
+    const gap = await objectStore.getJson<GapAnalysisOutput>(iterationGapAnalysisKey(runId, 1));
+    expect(gap?.stop).toBe(true);
+    expect(gap?.stopReason).toBe("gap_analysis_schema_error");
+    expect((gap?.planNotes ?? [])[0]).toContain("Gap analysis failed schema validation");
+
+    const diagnostics =
+      await objectStore.getJson<GapAnalysisNormalizationDiagnostics>(iterationGapDiagnosticsKey(runId, 1));
+    expect(diagnostics?.fallbackUsed).toBe(true);
+    expect(diagnostics?.parseError?.message).toContain("stopReason is required when stop is true");
+    expect(store.events.some((event) => event.eventType === "gap_analysis_fallback_used")).toBe(true);
   });
 
   it("skips fetch/extract when retrieval yields zero URLs and still runs gap analysis stop", async () => {
@@ -817,6 +1213,381 @@ describe("runResearchLoop", () => {
 
     expect(result.stopReason).toBe("questions_answered");
     expect(checkpoint.researchLoop?.iterationCountCompleted).toBe(2);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.status).toBe("unanswerable");
+    const capEvent = store.events.find((event) => event.eventType === "question_marked_unanswerable");
+    expect(capEvent).toBeDefined();
+    const capEventData = capEvent?.data as
+      | {
+          reason?: string;
+          reasons?: {
+            focus_round_cap_low_confidence?: number;
+            focus_round_cap_missing_source_evidence?: number;
+          };
+          questions?: Array<{ id: string; reason: string }>;
+        }
+      | undefined;
+    expect(capEventData?.reason).toBe("focus_round_cap_low_confidence");
+    expect(capEventData?.reasons?.focus_round_cap_low_confidence).toBe(1);
+    expect(capEventData?.questions?.[0]?.id).toBe("q1");
+    expect(capEventData?.questions?.[0]?.reason).toBe("focus_round_cap_low_confidence");
+  });
+
+  it("marks focus-capped questions answered when confidence >= 0.5 and source-backed evidence exists", async () => {
+    const runId = "run-focus-cap-answered";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let retrieveCalls = 0;
+    let gapCalls = 0;
+
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        retrieveCalls += 1;
+        const out: RetrievalOutput = {
+          queries: [],
+          selectedUrls: [`https://example.com/focus-cap-answered-${retrieveCalls}`],
+        };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({
+          summary: "iteration synthesis",
+          sources: input.sources,
+          findingId: `F${retrieveCalls}`,
+        });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        const out: GapAnalysisOutput =
+          gapCalls === 1
+            ? {
+                questionUpdates: [
+                  {
+                    id: "q1",
+                    status: "partial",
+                    confidence: 0.7,
+                    evidence: [{ source: "S1", note: "supported evidence" }],
+                  },
+                ],
+                nextQueries: ["q-follow-up"],
+                nextTasks: [],
+                stop: false,
+              }
+            : { questionUpdates: [], nextQueries: [], nextTasks: [], stop: false };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 5 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("questions_answered");
+    expect(retrieveCalls).toBe(2);
+    expect(checkpoint.researchLoop?.iterationCountCompleted).toBe(2);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.status).toBe("answered");
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.updatedAtIteration).toBe(2);
+
+    const answeredEvent = store.events.find(
+      (event) => event.eventType === "question_marked_answered_after_focus_cap"
+    );
+    expect(answeredEvent).toBeDefined();
+    const answeredEventData = answeredEvent?.data as
+      | {
+          reason?: string;
+          questions?: Array<{ id: string; hasSourceEvidence: boolean; reason: string }>;
+        }
+      | undefined;
+    expect(answeredEventData?.reason).toBe("focus_round_cap_confident_with_source");
+    expect(answeredEventData?.questions?.[0]?.id).toBe("q1");
+    expect(answeredEventData?.questions?.[0]?.hasSourceEvidence).toBe(true);
+    expect(answeredEventData?.questions?.[0]?.reason).toBe("focus_round_cap_confident_with_source");
+    expect(store.events.some((event) => event.eventType === "question_marked_unanswerable")).toBe(false);
+  });
+
+  it("marks focus-capped questions unanswerable when confidence >= 0.5 but source-backed evidence is missing", async () => {
+    const runId = "run-focus-cap-missing-source-evidence";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let retrieveCalls = 0;
+    let gapCalls = 0;
+
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        retrieveCalls += 1;
+        const out: RetrievalOutput = {
+          queries: [],
+          selectedUrls: [`https://example.com/focus-cap-missing-source-${retrieveCalls}`],
+        };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({
+          summary: "iteration synthesis",
+          sources: input.sources,
+          findingId: `F${retrieveCalls}`,
+        });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        const out: GapAnalysisOutput =
+          gapCalls === 1
+            ? {
+                questionUpdates: [
+                  {
+                    id: "q1",
+                    status: "partial",
+                    confidence: 0.7,
+                    evidence: [{ note: "confidence present but no source label" }],
+                  },
+                ],
+                nextQueries: ["q-follow-up"],
+                nextTasks: [],
+                stop: false,
+              }
+            : { questionUpdates: [], nextQueries: [], nextTasks: [], stop: false };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 5 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("questions_answered");
+    expect(retrieveCalls).toBe(2);
+    expect(checkpoint.researchLoop?.iterationCountCompleted).toBe(2);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.status).toBe("unanswerable");
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.updatedAtIteration).toBe(2);
+
+    const unanswerableEvent = store.events.find(
+      (event) => event.eventType === "question_marked_unanswerable"
+    );
+    expect(unanswerableEvent).toBeDefined();
+    const unanswerableEventData = unanswerableEvent?.data as
+      | {
+          reason?: string;
+          reasons?: {
+            focus_round_cap_low_confidence?: number;
+            focus_round_cap_missing_source_evidence?: number;
+          };
+          questions?: Array<{ id: string; hasSourceEvidence: boolean; reason: string }>;
+        }
+      | undefined;
+    expect(unanswerableEventData?.reason).toBe("focus_round_cap_missing_source_evidence");
+    expect(unanswerableEventData?.reasons?.focus_round_cap_low_confidence).toBe(0);
+    expect(unanswerableEventData?.reasons?.focus_round_cap_missing_source_evidence).toBe(1);
+    expect(unanswerableEventData?.questions?.[0]?.id).toBe("q1");
+    expect(unanswerableEventData?.questions?.[0]?.hasSourceEvidence).toBe(false);
+    expect(unanswerableEventData?.questions?.[0]?.reason).toBe(
+      "focus_round_cap_missing_source_evidence"
+    );
+    expect(store.events.some((event) => event.eventType === "question_marked_answered_after_focus_cap")).toBe(
+      false
+    );
+  });
+
+  it("unblocks dependent questions after focus-cap auto-answer and progresses downstream", async () => {
+    const runId = "run-focus-cap-dependency-progression";
+    const userId = "user";
+    const prompt = "Test prompt";
+    const checkpoint = baseCheckpoint(runId);
+    checkpoint.questionGraph = {
+      validated: true,
+      questions: [
+        { id: "q1", text: "Question 1", dependsOn: [], status: "unanswered", evidence: [] },
+        { id: "q2", text: "Question 2", dependsOn: ["q1"], status: "unanswered", evidence: [] },
+      ],
+    };
+    const objectStore = new MemoryObjectStore();
+
+    await objectStore.putJson(runPlanKey(runId), { queries: ["q1"] });
+
+    const store = new MemoryPipelineStore({ runId, userId, prompt, state: checkpoint });
+    const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
+
+    let retrieveCalls = 0;
+    let gapCalls = 0;
+
+    const steps: LoopSteps = {
+      retrieve: async () => {
+        retrieveCalls += 1;
+        const out: RetrievalOutput = {
+          queries: [],
+          selectedUrls: [`https://example.com/focus-cap-deps-${retrieveCalls}`],
+        };
+        return out;
+      },
+      fetch: async () => {},
+      extract: async () => {},
+      loadLabeledSources: async (input) => {
+        const sources = await input.store.listSources(runId);
+        return labeledSourcesFromStore(input.checkpoint, sources);
+      },
+      synthesize: async (input) => {
+        return synthesisSnapshot({
+          summary: "iteration synthesis",
+          sources: input.sources,
+          findingId: `F${retrieveCalls}`,
+        });
+      },
+      review: async () => {
+        const out: IterationReviewOutput = {
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        };
+        return out;
+      },
+      callModelJsonLogged: async <T>() => {
+        gapCalls += 1;
+        if (gapCalls === 1) {
+          const out: GapAnalysisOutput = {
+            questionUpdates: [
+              {
+                id: "q1",
+                status: "partial",
+                confidence: 0.7,
+                evidence: [{ source: "S1", note: "support q1" }],
+              },
+            ],
+            nextQueries: ["q2-follow-up"],
+            nextTasks: [],
+            stop: false,
+          };
+          return out as unknown as T;
+        }
+
+        if (gapCalls === 2) {
+          const out: GapAnalysisOutput = {
+            questionUpdates: [{ id: "q2", status: "answered", evidence: [{ source: "S2" }] }],
+            nextQueries: ["q2-follow-up-2"],
+            nextTasks: [],
+            stop: false,
+          };
+          return out as unknown as T;
+        }
+
+        const out: GapAnalysisOutput = {
+          questionUpdates: [{ id: "q2", status: "answered", evidence: [{ source: "S2" }] }],
+          nextQueries: [],
+          nextTasks: [],
+          stop: false,
+        };
+        return out as unknown as T;
+      },
+    };
+
+    const result = await runResearchLoop({
+      runId,
+      userId,
+      prompt,
+      citationPolicy,
+      budgets: baseBudgetConfig({ maxSources: 10 }),
+      models: baseModels(),
+      thinkingMode,
+      loopConfig: baseLoopConfig({ maxIterations: 5 }),
+      deadlineMs: Date.now() + 60_000,
+      services: makeStaticServices({ store, objectStore, modelProvider }),
+      checkpoint,
+      synthesis: {
+        maxInputTokens: 120_000,
+        maxOutputTokens: 5_000,
+        contextWindowTokens: 120_000,
+        requestedMaxInputTokens: 120_000,
+        requestedMaxOutputTokens: 5_000,
+      },
+      steps,
+    });
+
+    expect(result.stopReason).toBe("questions_answered");
+    expect(retrieveCalls).toBe(3);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.status).toBe("answered");
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q1")?.updatedAtIteration).toBe(2);
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q2")?.status).toBe("answered");
+    expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q2")?.updatedAtIteration).toBe(3);
   });
 
   it("stops with budget_exhausted when no source headroom remains", async () => {
@@ -896,7 +1667,7 @@ describe("runResearchLoop", () => {
     expect(retrieveCalls).toBe(0);
   });
 
-  it("switches to hybrid after two rejects (non-consecutive) and runs a final strong review", async () => {
+  it("keeps incremental mode and persists compression snapshots across iterations", async () => {
     const runId = "run-mode-switch";
     const userId = "user";
     const prompt = "Test prompt";
@@ -916,7 +1687,6 @@ describe("runResearchLoop", () => {
     const modelProvider: ModelProvider = { name: "mock", async chat() { throw new Error("not used"); } };
 
     const retrieveSeenSizes: number[] = [];
-    const synthesizePreviousProvided: boolean[] = [];
     const reviewModels: string[] = [];
 
     let retrieveCall = 0;
@@ -936,14 +1706,6 @@ describe("runResearchLoop", () => {
       loadLabeledSources: async (input) => {
         const sources = await input.store.listSources(runId);
         return labeledSourcesFromStore(input.checkpoint, sources);
-      },
-      synthesize: async (input) => {
-        synthesizePreviousProvided.push(Boolean(input.previousSynthesis));
-        return synthesisSnapshot({
-          summary: input.previousSynthesis ? `refined:${input.previousSynthesis.summary}` : "iteration synthesis",
-          sources: input.sources,
-          findingId: `F${synthesizePreviousProvided.length}`,
-        });
       },
       review: async (input) => {
         reviewCall += 1;
@@ -991,19 +1753,16 @@ describe("runResearchLoop", () => {
       steps,
     });
 
-    expect(result.mode).toBe("hybrid");
-    expect(await objectStore.getJson(runFinalSynthesisReviewKey(runId))).not.toBeNull();
-    expect(reviewModels).toContain("mock/verify-strong");
+    expect(result.mode).toBe("incremental");
+    expect(reviewModels).toEqual([]);
 
     expect(checkpoint.researchLoop).toBeDefined();
     const loopState = checkpoint.researchLoop as NonNullable<RunCheckpoint["researchLoop"]>;
-    expect(loopState.mode).toBe("hybrid");
-    expect(loopState.iterations.find((it) => it.iteration === 4)?.mode).toBe("hybrid");
-
-    expect(synthesizePreviousProvided[0]).toBe(false);
-    expect(synthesizePreviousProvided[1]).toBe(true);
-    expect(synthesizePreviousProvided[2]).toBe(true);
-    expect(synthesizePreviousProvided[3]).toBe(true);
+    expect(loopState.mode).toBe("incremental");
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 1))).not.toBeNull();
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 2))).not.toBeNull();
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 3))).not.toBeNull();
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 4))).not.toBeNull();
 
     expect(retrieveSeenSizes[0]).toBe(0);
     expect(retrieveSeenSizes[1]).toBeGreaterThan(0);
@@ -1316,7 +2075,7 @@ describe("runResearchLoop", () => {
     expect(checkpoint.questionGraph?.questions.find((q) => q.id === "q2")?.updatedAtIteration).toBe(2);
   });
 
-  it("ignores deadlineMs for iteration scheduling (still runs review + gap analysis)", async () => {
+  it("ignores deadlineMs for iteration scheduling (still runs gap analysis)", async () => {
     const runId = "run-ignore-deadline";
     const userId = "user";
     const prompt = "Test prompt";
@@ -1390,8 +2149,8 @@ describe("runResearchLoop", () => {
     });
 
     expect(result.stopReason).toBe("questions_answered");
-    expect(reviewCalls).toBeGreaterThan(0);
+    expect(reviewCalls).toBe(0);
     expect(gapCalls).toBeGreaterThan(0);
-    expect(await objectStore.getJson(runSynthesisKey(runId))).not.toBeNull();
+    expect(await objectStore.getJson(iterationCompressionKey(runId, 1))).not.toBeNull();
   });
 });

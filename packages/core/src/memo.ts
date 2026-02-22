@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { CitationPolicy } from "./config.js";
 import type { ExtractedQuote } from "./extract.js";
+import type { OutlinePlan } from "./outline-plan.js";
 
 export const SynthesisCitationSchema = z.object({
   source: z.string().min(1),
@@ -12,6 +13,17 @@ export const SynthesisClaimSchema = z.object({
   id: z.string().min(1),
   text: z.string().min(1),
   citations: z.array(SynthesisCitationSchema).default([]),
+});
+
+export const DynamicOutlineSectionSchema = z.object({
+  heading: z.string().min(1),
+  body: z.string().min(1),
+  citations: z.array(SynthesisCitationSchema).default([]),
+});
+
+export const OutlineSuggestionSchema = z.object({
+  heading: z.string().min(1),
+  rationale: z.string().min(1).optional(),
 });
 
 export const SynthesisOutputSchema = z.object({
@@ -57,6 +69,8 @@ export const SynthesisOutputSchema = z.object({
     )
     .optional(),
   unknowns: z.array(z.string().min(1)).default([]),
+  outlineSections: z.array(DynamicOutlineSectionSchema).optional(),
+  outlineSuggestions: z.array(OutlineSuggestionSchema).optional(),
 });
 
 export type SynthesisOutput = z.infer<typeof SynthesisOutputSchema>;
@@ -93,6 +107,11 @@ export type CitationMap = {
       sourceId: string;
       quote?: { quoteId: string; start: number; end: number; text: string };
     }>;
+    unresolvedQuoteReferences?: Array<{
+      sourceLabel: string;
+      sourceId: string;
+      quoteId: string;
+    }>;
   }>;
 };
 
@@ -117,11 +136,24 @@ export function buildCitationMap(input: {
       fetchedAt: s.fetchedAt,
     })),
     claims: input.synthesis.keyFindings.map((c) => {
+      const unresolvedQuoteReferences: Array<{
+        sourceLabel: string;
+        sourceId: string;
+        quoteId: string;
+      }> = [];
       const citations = c.citations
         .map((cit) => {
           const src = sourcesByLabel.get(cit.source);
           if (!src) return null;
-          const quote = cit.quoteId ? src.quotes.find((q) => q.quoteId === cit.quoteId) : undefined;
+          const quoteId = typeof cit.quoteId === "string" ? cit.quoteId.trim() : "";
+          const quote = quoteId ? src.quotes.find((q) => q.quoteId === quoteId) : undefined;
+          if (quoteId && !quote) {
+            unresolvedQuoteReferences.push({
+              sourceLabel: src.label,
+              sourceId: src.sourceId,
+              quoteId,
+            });
+          }
           return {
             sourceLabel: src.label,
             sourceId: src.sourceId,
@@ -136,7 +168,12 @@ export function buildCitationMap(input: {
         quote?: { quoteId: string; start: number; end: number; text: string };
       }>;
 
-      return { id: c.id, text: c.text, citations };
+      return {
+        id: c.id,
+        text: c.text,
+        citations,
+        ...(unresolvedQuoteReferences.length > 0 ? { unresolvedQuoteReferences } : {}),
+      };
     }),
   };
 }
@@ -148,10 +185,102 @@ function mdEscape(text: string): string {
 export function renderResearchMemoMarkdown(input: {
   synthesis: SynthesisOutput;
   citationMap: CitationMap;
+  outlinePlan?: OutlinePlan;
 }): string {
+  const resolveBodyForPlannedSection = (heading: string): string => {
+    const lower = heading.toLowerCase();
+    const asBullets = (items: string[], emptyText: string) =>
+      items.length ? items.map((item) => `- ${mdEscape(item)}`).join("\n") : `- ${emptyText}`;
+
+    if (lower.includes("summary")) return mdEscape(input.synthesis.summary);
+    if (lower.includes("finding") || lower.includes("question") || lower.includes("insight")) {
+      return input.citationMap.claims.length
+        ? input.citationMap.claims.map((claim) => `- ${mdEscape(claim.text)}`).join("\n")
+        : "- No findings available.";
+    }
+    if (lower.includes("contradiction")) {
+      return asBullets(input.synthesis.contradictions ?? [], "No contradictions identified.");
+    }
+    if (lower.includes("recommend")) {
+      return asBullets(input.synthesis.recommendations ?? [], "No recommendations available.");
+    }
+    if (lower.includes("unknown")) {
+      return asBullets(input.synthesis.unknowns, "None noted.");
+    }
+    if (lower.includes("source")) {
+      return input.citationMap.sources.length
+        ? input.citationMap.sources
+            .map((source) => `- ${mdEscape(source.title ?? source.url)} — ${source.url}`)
+            .join("\n")
+        : "- No sources.";
+    }
+    return mdEscape(input.synthesis.summary);
+  };
+
+  const buildDynamicOutlineSections = (): Array<{
+    heading: string;
+    body: string;
+    citations: string[];
+  }> => {
+    if ((input.synthesis.outlineSections?.length ?? 0) > 0) {
+      return (input.synthesis.outlineSections ?? [])
+        .map((section) => ({
+          heading: section.heading.trim(),
+          body: section.body.trim(),
+          citations: Array.from(
+            new Set(
+              (section.citations ?? [])
+                .map((citation) => citation.source.trim())
+                .filter(Boolean)
+            )
+          ),
+        }))
+        .filter((section) => section.heading.length > 0 && section.body.length > 0);
+    }
+
+    if ((input.outlinePlan?.sections.length ?? 0) === 0) return [];
+    return (input.outlinePlan?.sections ?? [])
+      .map((section) => ({
+        heading: section.heading.trim(),
+        body: resolveBodyForPlannedSection(section.heading),
+        citations: [] as string[],
+      }))
+      .filter((section) => section.heading.length > 0 && section.body.length > 0);
+  };
+
+  const dynamicSections = buildDynamicOutlineSections();
   const lines: string[] = [];
   lines.push("# Research memo");
   lines.push("");
+
+  if (dynamicSections.length > 0) {
+    for (const section of dynamicSections) {
+      lines.push(`## ${mdEscape(section.heading)}`);
+      lines.push("");
+      lines.push(mdEscape(section.body));
+      lines.push("");
+      if (section.citations.length > 0) {
+        const citationRefs = section.citations
+          .map((source) => `[^${source}]`)
+          .join("");
+        if (citationRefs) {
+          lines.push(`Citations: ${citationRefs}`);
+          lines.push("");
+        }
+      }
+    }
+
+    lines.push("## Sources");
+    lines.push("");
+    for (const s of input.citationMap.sources) {
+      const title = s.title ?? s.url;
+      const fetched = s.fetchedAt ? ` (fetched ${s.fetchedAt})` : "";
+      lines.push(`[^${s.label}]: ${mdEscape(title)} — ${s.url}${fetched}`);
+    }
+    lines.push("");
+
+    return lines.join("\n");
+  }
 
   lines.push("## Summary");
   lines.push("");

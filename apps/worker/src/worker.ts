@@ -81,12 +81,16 @@ export async function runWorker(opts?: { once?: boolean }): Promise<void> {
             baseUrl?: string;
             appName?: string;
             appUrl?: string;
+            requestTimeoutMs?: number;
           } = {
             apiKey: config.openRouter.apiKey,
             baseUrl: config.openRouter.baseUrl,
             appName: config.openRouter.appName,
           };
           if (config.openRouter.appUrl) out.appUrl = config.openRouter.appUrl;
+          if (config.openRouter.requestTimeoutMs !== undefined) {
+            out.requestTimeoutMs = config.openRouter.requestTimeoutMs;
+          }
           return out;
         })()
       )
@@ -136,6 +140,11 @@ export async function runWorker(opts?: { once?: boolean }): Promise<void> {
         runId: run.id,
         config,
         services,
+        executionContext: {
+          owner: "worker",
+          jobId: job.id,
+          startedAt: new Date().toISOString(),
+        },
         shouldCancel: async () => {
           const j = await store.getJob(job.id);
           return j?.status === "canceled";

@@ -93,3 +93,65 @@ Status: complete
 
 ### Follow-up validation
 - Added an explicit dependency-unlock loop test; re-ran `npm run typecheck` + `npm test` (pass)
+
+## 2026-02-22 — Follow-up: parser parity, dynamic outline, and DAG reliability
+
+Status: complete
+
+### Scope delivered
+- Added harness-parity document parsing in core for binary sources (`PDF`, `DOCX`, `XLSX`) with dynamic imports and structured failures (no OCR in this pass):
+  - `packages/core/src/document-extract.ts`
+  - integrated into `extractPhase` before legacy UTF-8/HTML decoding.
+- Added dynamic outline planning + evolution support:
+  - `packages/core/src/outline-plan.ts` (schema/coercion/fallback outline generator)
+  - planner output now accepts `outlinePlan`
+  - gap-analysis can revise `outlinePlan` per iteration
+  - outline persisted as run + iteration artifacts (`runOutlinePlanKey`, `iterationOutlinePlanKey`).
+- Added hybrid synthesis outline interaction:
+  - synthesis schema now accepts optional `outlineSections` and `outlineSuggestions`
+  - synthesis prompt now accepts `outlinePlan` and can draft outline-aligned sections.
+- Finalize now renders dynamic outline by default when available and emits explicit observability event:
+  - event: `finalize.dynamic_outline_used`
+  - fallback to legacy fixed memo structure remains in place.
+- Improved dependency graph reliability and deterministic behavior:
+  - extraction prompt now favors practical DAGs and parallelizable independence
+  - dependency normalization maps id/index/text refs to canonical `qN`
+  - deterministic moderate inference for flat outputs with sequence cues
+  - pruning strategy defaults to transitive reduction; flatten is explicit fallback mode only
+  - diagnostics artifact/event added for graph transforms.
+- Updated graph validation logic to avoid silent blanket flattening:
+  - `validateQuestionGraph` now minimally prunes invalid/missing/self/cyclic edges and preserves remaining DAG structure.
+
+### Config/defaults
+- Added config support and defaults:
+  - `researchLoop.dynamicOutlineEnabled` (default `true`)
+  - `questionGraph.dependencyInferenceMode` (default `moderate`)
+  - `questionGraph.pruneStrategy` (default `transitive_reduction`)
+  - `questionGraph.maxDepth` (default `4`)
+- Updated `openresearch.config.example.json` accordingly.
+
+### Tests added/updated
+- Added `packages/core/src/document-extract.test.ts`:
+  - PDF/DOCX/XLSX parse success
+  - binary parser failure behavior
+  - HTML readability/dom-text path behavior.
+- Expanded `packages/core/src/memo.test.ts`:
+  - dynamic outline section rendering
+  - planner outline fallback rendering.
+- Updated `packages/core/src/question-graph-pruning.test.ts`:
+  - transitive pruning without flattening
+  - dependency inference from flat chain cues (TechR2/Meta-style)
+  - diagnostics artifact assertions.
+- Updated `packages/core/src/goal-directed.test.ts` for minimal-prune graph validation semantics.
+
+### Observability additions
+- `question_graph_diagnostics` event + artifact (`runs/<run>/question-graph-diagnostics.json`)
+- `outline_plan_updated` iteration event
+- `finalize.dynamic_outline_used` event
+- CLI event message mapping updated in `apps/cli/src/index.ts`.
+
+### Validation commands
+- `npm run typecheck` (pass)
+- `npm run test` (pass)
+- `npm run lint` (pass)
+- `npm run build` (pass)

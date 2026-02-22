@@ -21,14 +21,23 @@ export class OpenRouterModelProvider implements ModelProvider {
   private readonly baseUrl: string;
   private readonly appName: string;
   private readonly appUrl: string | undefined;
+  private readonly requestTimeoutMs: number;
 
   static readonly EMPTY_RESPONSE_MARKER = "EMPTY_MODEL_RESPONSE";
+  static readonly TIMEOUT_RESPONSE_MARKER = "MODEL_CALL_TIMEOUT";
 
-  constructor(opts: { apiKey: string; baseUrl?: string; appName?: string; appUrl?: string }) {
+  constructor(opts: {
+    apiKey: string;
+    baseUrl?: string;
+    appName?: string;
+    appUrl?: string;
+    requestTimeoutMs?: number;
+  }) {
     this.apiKey = opts.apiKey;
     this.baseUrl = opts.baseUrl ?? "https://openrouter.ai/api/v1";
     this.appName = opts.appName ?? "openresearch";
     this.appUrl = opts.appUrl;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? 120_000;
   }
 
   async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
@@ -48,7 +57,27 @@ export class OpenRouterModelProvider implements ModelProvider {
     };
     if (this.appUrl) headers["http-referer"] = this.appUrl;
 
-    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(
+          `${OpenRouterModelProvider.TIMEOUT_RESPONSE_MARKER}: Request timed out after ${this.requestTimeoutMs}ms`
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+
     const json = (await res.json().catch(() => ({}))) as OpenRouterChatResponse;
     if (!res.ok) {
       const msg = json.error?.message ?? `OpenRouter error: ${res.status} ${res.statusText}`;

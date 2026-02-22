@@ -71,6 +71,24 @@ export function validateCitations(input: {
       continue;
     }
 
+    if (Array.isArray(claim.unresolvedQuoteReferences)) {
+      const unresolvedSeverity: VerificationIssueSeverity =
+        input.policy === "strict" ? "error" : "warn";
+      for (const unresolved of claim.unresolvedQuoteReferences) {
+        issues.push(
+          issue(
+            unresolvedSeverity,
+            "unresolved_quote_reference",
+            `Citation references missing quoteId "${unresolved.quoteId}"`,
+            {
+              claimId: claim.id,
+              sourceLabel: unresolved.sourceLabel,
+            }
+          )
+        );
+      }
+    }
+
     for (const cit of claim.citations) {
       citedSourceLabels.add(cit.sourceLabel);
       const sourceRow = sourcesById.get(cit.sourceId);

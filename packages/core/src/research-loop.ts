@@ -2,33 +2,28 @@ import { z } from "zod";
 
 import type { BudgetConfig, CitationPolicy, PhaseModelConfig, ResearchLoopConfig, ThinkingMode } from "./config.js";
 import type { SearchAdapter, HttpFetchAdapter, BrowserRenderAdapter } from "./adapters.js";
-import type { ExtractedEvidence } from "./extract.js";
 import type { ChatMessage, ModelProvider } from "./models.js";
 import type { LabeledSource, SynthesisOutput } from "./memo.js";
-import { buildCitationMap } from "./memo.js";
-import { validateCitations, type VerificationReport } from "./verify.js";
 import {
-  QuestionEvidenceSchema,
   QuestionGraphSchema,
   computeUnblockedQuestions,
   normalizeQuestionAnsweredRubric,
   validateQuestionGraph,
 } from "./goal-directed.js";
-import type { QuestionGraph, QuestionStatus } from "./goal-directed.js";
+import type { QuestionEvidence, QuestionGraph, QuestionStatus } from "./goal-directed.js";
 import {
-  iterationCitationMapKey,
+  iterationCompressionKey,
   iterationGapAnalysisKey,
+  iterationGapDiagnosticsKey,
+  iterationOutlinePlanKey,
   iterationPlanKey,
   iterationRetrievalKey,
-  iterationReviewKey,
-  iterationSynthesisKey,
-  iterationVerificationJsonKey,
-  iterationVerificationMarkdownKey,
+  runOutlinePlanKey,
   runPlanKey,
-  runFinalSynthesisReviewKey,
-  runSynthesisKey,
   sourceEvidenceKey,
 } from "./artifacts.js";
+import { coerceOutlinePlan, OutlinePlanSchema } from "./outline-plan.js";
+import type { OutlinePlan } from "./outline-plan.js";
 
 import type { ObjectStore, PipelineSourceRow, PipelineStore, RunCheckpoint } from "./orchestrator.js";
 import { normalizeUrl } from "./url.js";
@@ -55,15 +50,12 @@ export type ResearchLoopIterationState = {
   netNewSources: number;
   artifacts: {
     planKey: string;
+    outlinePlanKey: string;
+    compressionKey: string;
     retrievalKey: string;
-    synthesisKey: string;
-    citationMapKey: string;
-    verificationJsonKey: string;
-    verificationMarkdownKey: string;
-    reviewKey: string;
     gapAnalysisKey: string;
+    gapDiagnosticsKey: string;
   };
-  reviewVerdict?: "accept" | "revise" | "reject" | "unknown";
   gapAnalysisStop?: boolean;
   gapAnalysisStopReason?: string;
   stopReason?: ResearchLoopStopReason;
@@ -77,6 +69,7 @@ export type ResearchLoopCheckpointState = {
   maxIterations: number;
   sourcesPerIteration?: number;
   switchToHybridAfterRejects: number;
+  dynamicOutlineEnabled: boolean;
   rejectCount: number;
   iterationCountCompleted: number;
   stopReason?: ResearchLoopStopReason;
@@ -85,15 +78,17 @@ export type ResearchLoopCheckpointState = {
   seenTasks: string[];
   unansweredStreaks: Record<string, number>;
   pending: { queries: string[]; tasks: string[] };
-  lastSynthesisKey?: string;
+  lastCompressionKey?: string;
   planVersionKeys: string[];
   lowValueIterationStreak: number;
+  currentOutlinePlan?: OutlinePlan;
   iterations: ResearchLoopIterationState[];
 };
 
 const InitialPlanSchema = z.object({
   subquestions: z.array(z.string()).default([]),
   queries: z.array(z.string()).default([]),
+  outlinePlan: OutlinePlanSchema.optional(),
 });
 
 const GapAnalysisModelSchema = z.object({
@@ -102,13 +97,22 @@ const GapAnalysisModelSchema = z.object({
       z.object({
         id: z.string().min(1),
         status: z.enum(["unanswered", "partial", "answered", "unanswerable"]),
-        evidence: z.array(QuestionEvidenceSchema).default([]),
+        evidence: z
+          .array(
+            z.object({
+              source: z.string().min(1).optional(),
+              quoteId: z.string().min(1).optional(),
+              note: z.string().min(1).optional(),
+            })
+          )
+          .default([]),
         confidence: z.number().min(0).max(1).optional(),
       })
     )
     .default([]),
   nextQueries: z.array(z.string().min(1)).default([]),
   nextTasks: z.array(z.string().min(1)).default([]),
+  outlinePlan: OutlinePlanSchema.optional(),
   stop: z.boolean().default(false),
   stopReason: z.string().optional(),
   planNotes: z.array(z.string().min(1)).optional(),
@@ -124,14 +128,204 @@ const GapAnalysisOutputSchema = GapAnalysisModelSchema.superRefine((value, ctx) 
 });
 export type GapAnalysisOutput = z.infer<typeof GapAnalysisOutputSchema>;
 
-function normalizeGapAnalysisOutput(raw: unknown): unknown {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+export type GapAnalysisNormalizationDiagnostics = {
+  changed: boolean;
+  fallbackUsed: boolean;
+  dropped: {
+    stopReasonEmpty: boolean;
+    emptyQuoteIds: number;
+    nextQueries: number;
+    nextTasks: number;
+    planNotes: number;
+  };
+  trimmed: {
+    stopReason: boolean;
+    quoteIds: number;
+    nextQueries: number;
+    nextTasks: number;
+    planNotes: number;
+  };
+  deduped: {
+    nextQueries: number;
+    nextTasks: number;
+    planNotes: number;
+  };
+  clampedConfidenceCount: number;
+  outlineVersionCoerced: boolean;
+  parseError?: {
+    name: string;
+    message: string;
+  };
+};
+
+function createGapAnalysisNormalizationDiagnostics(): GapAnalysisNormalizationDiagnostics {
+  return {
+    changed: false,
+    fallbackUsed: false,
+    dropped: {
+      stopReasonEmpty: false,
+      emptyQuoteIds: 0,
+      nextQueries: 0,
+      nextTasks: 0,
+      planNotes: 0,
+    },
+    trimmed: {
+      stopReason: false,
+      quoteIds: 0,
+      nextQueries: 0,
+      nextTasks: 0,
+      planNotes: 0,
+    },
+    deduped: {
+      nextQueries: 0,
+      nextTasks: 0,
+      planNotes: 0,
+    },
+    clampedConfidenceCount: 0,
+    outlineVersionCoerced: false,
+  };
+}
+
+function normalizeGapAnalysisOutput(raw: unknown): {
+  value: unknown;
+  diagnostics: GapAnalysisNormalizationDiagnostics;
+} {
+  const diagnostics = createGapAnalysisNormalizationDiagnostics();
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { value: raw, diagnostics };
+  }
+
   const cast = raw as Record<string, unknown>;
-  if (typeof cast.stopReason !== "string") return raw;
-  if (cast.stopReason.trim() !== "") return raw;
   const normalized: Record<string, unknown> = { ...cast };
-  delete normalized.stopReason;
-  return normalized;
+  let changed = false;
+
+  const normalizeStringList = (
+    field: "nextQueries" | "nextTasks" | "planNotes"
+  ): void => {
+    const current = normalized[field];
+    if (!Array.isArray(current)) return;
+
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    for (const item of current) {
+      if (typeof item !== "string") {
+        diagnostics.dropped[field] += 1;
+        changed = true;
+        continue;
+      }
+
+      const trimmed = item.trim();
+      if (trimmed !== item) {
+        diagnostics.trimmed[field] += 1;
+        changed = true;
+      }
+
+      if (!trimmed) {
+        diagnostics.dropped[field] += 1;
+        changed = true;
+        continue;
+      }
+
+      if (seen.has(trimmed)) {
+        diagnostics.deduped[field] += 1;
+        changed = true;
+        continue;
+      }
+
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+
+    normalized[field] = out;
+  };
+
+  if (typeof normalized.stopReason === "string") {
+    const trimmed = normalized.stopReason.trim();
+    if (!trimmed) {
+      diagnostics.dropped.stopReasonEmpty = true;
+      delete normalized.stopReason;
+      changed = true;
+    } else if (trimmed !== normalized.stopReason) {
+      diagnostics.trimmed.stopReason = true;
+      normalized.stopReason = trimmed;
+      changed = true;
+    }
+  }
+
+  normalizeStringList("nextQueries");
+  normalizeStringList("nextTasks");
+  normalizeStringList("planNotes");
+
+  if (Array.isArray(normalized.questionUpdates)) {
+    const updates = normalized.questionUpdates.map((update) => {
+      if (!update || typeof update !== "object" || Array.isArray(update)) return update;
+      const updateRecord = update as Record<string, unknown>;
+      const nextUpdate: Record<string, unknown> = { ...updateRecord };
+      let updateChanged = false;
+
+      if (typeof nextUpdate.confidence === "number" && Number.isFinite(nextUpdate.confidence)) {
+        const clamped = Math.max(0, Math.min(1, nextUpdate.confidence));
+        if (clamped !== nextUpdate.confidence) {
+          diagnostics.clampedConfidenceCount += 1;
+          nextUpdate.confidence = clamped;
+          updateChanged = true;
+        }
+      }
+
+      if (Array.isArray(nextUpdate.evidence)) {
+        let evidenceChanged = false;
+        const evidence = nextUpdate.evidence.map((entry) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+          const evidenceRecord = entry as Record<string, unknown>;
+          const nextEvidence: Record<string, unknown> = { ...evidenceRecord };
+          let localChanged = false;
+
+          if (typeof nextEvidence.quoteId === "string") {
+            const trimmedQuoteId = nextEvidence.quoteId.trim();
+            if (!trimmedQuoteId) {
+              diagnostics.dropped.emptyQuoteIds += 1;
+              delete nextEvidence.quoteId;
+              localChanged = true;
+            } else if (trimmedQuoteId !== nextEvidence.quoteId) {
+              diagnostics.trimmed.quoteIds += 1;
+              nextEvidence.quoteId = trimmedQuoteId;
+              localChanged = true;
+            }
+          }
+
+          if (localChanged) {
+            evidenceChanged = true;
+            return nextEvidence;
+          }
+          return entry;
+        });
+        if (evidenceChanged) {
+          nextUpdate.evidence = evidence;
+          updateChanged = true;
+        }
+      }
+
+      if (updateChanged) {
+        changed = true;
+        return nextUpdate;
+      }
+      return update;
+    });
+    normalized.questionUpdates = updates;
+  }
+
+  if (normalized.outlinePlan && typeof normalized.outlinePlan === "object" && !Array.isArray(normalized.outlinePlan)) {
+    const outlinePlan = normalized.outlinePlan as Record<string, unknown>;
+    if (outlinePlan.version !== undefined && outlinePlan.version !== 1) {
+      diagnostics.outlineVersionCoerced = true;
+      normalized.outlinePlan = { ...outlinePlan, version: 1 };
+      changed = true;
+    }
+  }
+
+  diagnostics.changed = changed;
+  return { value: normalized, diagnostics };
 }
 
 const ReviewOutputSchema = z.object({
@@ -149,6 +343,23 @@ export type RetrievalOutput = {
     results: Array<{ url: string; title?: string; snippet?: string }>;
   }>;
   selectedUrls: string[];
+};
+
+export type IterationCompression = {
+  summary: string;
+  sourceAbstracts: Array<{
+    source: string;
+    methodology: string;
+    temporalContext: string;
+    dataTypes: string[];
+    stakeholderPosition: string;
+    representativeClaims: string[];
+    keyConstraints: string[];
+  }>;
+  criticalSourceContexts: Array<{ source: string; reason: string; excerpt: string }>;
+  synthesisNotes: string[];
+  sourceCount: number;
+  quoteCount: number;
 };
 
 export type LoopSteps = {
@@ -188,7 +399,20 @@ export type LoopSteps = {
     store: PipelineStore;
     objectStore: ObjectStore;
   }) => Promise<LabeledSource[]>;
-  synthesize: (input: {
+  compress?: (input: {
+    runId: string;
+    userId: string;
+    prompt: string;
+    sources: LabeledSource[];
+    citationPolicy: CitationPolicy;
+    provider: ModelProvider | undefined;
+    model: string;
+    thinkingMode: ThinkingMode;
+    store: PipelineStore;
+    objectStore: ObjectStore;
+    checkpoint: RunCheckpoint;
+  }) => Promise<IterationCompression>;
+  synthesize?: (input: {
     runId: string;
     userId: string;
     prompt: string;
@@ -206,9 +430,10 @@ export type LoopSteps = {
     objectStore: ObjectStore;
     checkpoint: RunCheckpoint;
     previousSynthesis?: SynthesisOutput;
+    outlinePlan?: OutlinePlan;
     reviewPolicy?: "enforce" | "skip";
   }) => Promise<SynthesisOutput>;
-  review: (input: {
+  review?: (input: {
     runId: string;
     userId: string;
     prompt: string;
@@ -264,26 +489,11 @@ function deriveSourcesPerIteration(input: {
   return Math.max(Math.ceil(maxSources / 5), 20);
 }
 
-function summarizeTopIssues(report: VerificationReport, limit: number): Array<{
-  severity: string;
-  code: string;
-  message: string;
-  claimId?: string;
-  sourceLabel?: string;
-}> {
-  return report.issues.slice(0, Math.max(0, limit)).map((issue) => ({
-    severity: issue.severity,
-    code: issue.code,
-    message: issue.message,
-    ...(issue.claimId ? { claimId: issue.claimId } : {}),
-    ...(issue.sourceLabel ? { sourceLabel: issue.sourceLabel } : {}),
-  }));
-}
-
 function defaultLoopCheckpoint(input: {
   enabled: boolean;
   config: ResearchLoopConfig;
   initialQueries: string[];
+  initialOutlinePlan?: OutlinePlan;
 }): ResearchLoopCheckpointState {
   const modeSetting = input.config.mode;
   const mode: ResearchLoopOperationalMode = modeSetting === "hybrid" ? "hybrid" : "incremental";
@@ -294,6 +504,7 @@ function defaultLoopCheckpoint(input: {
 	    mode,
 	    maxIterations: Math.max(1, Math.floor(input.config.maxIterations)),
 	    switchToHybridAfterRejects: Math.max(1, Math.floor(input.config.switchToHybridAfterRejects)),
+      dynamicOutlineEnabled: input.config.dynamicOutlineEnabled === true,
 	    rejectCount: 0,
 	    iterationCountCompleted: 0,
 	    seenUrls: [],
@@ -304,9 +515,10 @@ function defaultLoopCheckpoint(input: {
 	    planVersionKeys: [],
 	    lowValueIterationStreak: 0,
 	    iterations: [],
+      ...(input.initialOutlinePlan ? { currentOutlinePlan: input.initialOutlinePlan } : {}),
 	    ...(input.config.sourcesPerIteration !== undefined
-      ? { sourcesPerIteration: input.config.sourcesPerIteration }
-      : {}),
+	      ? { sourcesPerIteration: input.config.sourcesPerIteration }
+	      : {}),
   };
 }
 
@@ -336,10 +548,14 @@ function coerceLoopCheckpointState(
     ? o.modeSetting
     : fallback.modeSetting;
   const mode = o.mode === "hybrid" ? "hybrid" : "incremental";
-	  const sourcesPerIteration =
-	    typeof o.sourcesPerIteration === "number" && Number.isFinite(o.sourcesPerIteration) && o.sourcesPerIteration > 0
-	      ? Math.floor(o.sourcesPerIteration)
-	      : fallback.sourcesPerIteration;
+  const dynamicOutlineEnabled =
+    typeof o.dynamicOutlineEnabled === "boolean"
+      ? o.dynamicOutlineEnabled
+      : fallback.dynamicOutlineEnabled;
+		  const sourcesPerIteration =
+		    typeof o.sourcesPerIteration === "number" && Number.isFinite(o.sourcesPerIteration) && o.sourcesPerIteration > 0
+		      ? Math.floor(o.sourcesPerIteration)
+		      : fallback.sourcesPerIteration;
   const lowValueIterationStreak =
     typeof o.lowValueIterationStreak === "number" &&
     Number.isFinite(o.lowValueIterationStreak) &&
@@ -380,6 +596,7 @@ function coerceLoopCheckpointState(
 	    mode,
 	    maxIterations,
 	    switchToHybridAfterRejects,
+      dynamicOutlineEnabled,
 	    rejectCount,
 	    iterationCountCompleted,
 	    ...(stopReason ? { stopReason } : {}),
@@ -401,12 +618,21 @@ function coerceLoopCheckpointState(
     iterations: Array.isArray(o.iterations) ? (o.iterations as ResearchLoopIterationState[]) : fallback.iterations,
     lowValueIterationStreak,
     ...(sourcesPerIteration !== undefined ? { sourcesPerIteration } : {}),
-    ...(typeof o.lastSynthesisKey === "string"
-      ? { lastSynthesisKey: o.lastSynthesisKey }
-      : fallback.lastSynthesisKey
-        ? { lastSynthesisKey: fallback.lastSynthesisKey }
-        : {}),
-  };
+	    ...(typeof (o as { lastCompressionKey?: unknown }).lastCompressionKey === "string"
+	      ? { lastCompressionKey: (o as { lastCompressionKey: string }).lastCompressionKey }
+	      : fallback.lastCompressionKey
+	        ? { lastCompressionKey: fallback.lastCompressionKey }
+	        : {}),
+      ...(coerceOutlinePlan((o as { currentOutlinePlan?: unknown }).currentOutlinePlan)
+        ? {
+            currentOutlinePlan: coerceOutlinePlan(
+              (o as { currentOutlinePlan?: unknown }).currentOutlinePlan
+            )!,
+          }
+        : fallback.currentOutlinePlan
+          ? { currentOutlinePlan: fallback.currentOutlinePlan }
+          : {}),
+	  };
 }
 
 function normalizeSources(input: PipelineSourceRow[]): {
@@ -447,6 +673,81 @@ function filterPendingAgainstSeen(input: {
   const queries = dedupeStrings(input.pending.queries).filter((q) => !input.seenQueries.has(q));
   const tasks = dedupeStrings(input.pending.tasks).filter((t) => !input.seenTasks.has(t));
   return { queries, tasks };
+}
+
+function deriveQueriesFromTasks(input: {
+  tasks: string[];
+  maxQueries: number;
+}): { queries: string[]; filteredTaskCount: number } {
+  const out: string[] = [];
+  let filteredTaskCount = 0;
+
+  for (const rawTask of dedupeStrings(input.tasks)) {
+    if (out.length >= input.maxQueries) break;
+    let q = rawTask.trim().replace(/\s+/g, " ");
+    q = q.replace(/^[-*]\s+/, "").replace(/^\d+[.)]\s+/, "");
+    q = q.replace(/^(task|todo|next\s+step)\s*:\s*/i, "");
+    q = q.replace(
+      /^(find|search|look\s+up|investigate|review|analyze|assess|evaluate|determine|map|identify|collect|gather|research)\s+(for\s+)?/i,
+      ""
+    );
+    q = q.replace(/[.!?]+$/, "").trim();
+    const wordCount = q.length > 0 ? q.split(/\s+/).length : 0;
+    if (q.length < 8 || wordCount < 2) {
+      filteredTaskCount += 1;
+      continue;
+    }
+    out.push(q);
+  }
+
+  return {
+    queries: dedupeStrings(out).slice(0, input.maxQueries),
+    filteredTaskCount,
+  };
+}
+
+function buildDeterministicCompression(sources: LabeledSource[]): IterationCompression {
+  const sourceAbstracts = sources.map((source) => {
+    const representativeClaims = source.quotes
+      .slice(0, 3)
+      .map((quote) => quote.text.trim())
+      .filter(Boolean);
+    return {
+      source: source.label,
+      methodology: "Deterministic fallback: summarized from extracted quote evidence.",
+      temporalContext: "Unknown temporal context.",
+      dataTypes: representativeClaims.length > 0 ? ["quoted evidence"] : [],
+      stakeholderPosition: "Not inferred in deterministic compression fallback.",
+      representativeClaims,
+      keyConstraints: representativeClaims.length > 0 ? [] : ["No representative claims extracted."],
+    };
+  });
+
+  const criticalSourceContexts = sources
+    .slice(0, 6)
+    .map((source) => ({
+      source: source.label,
+      reason: "High-priority context sample for gap analysis.",
+      excerpt: source.quotes.map((q) => q.text).join(" ").slice(0, 2000),
+    }))
+    .filter((context) => context.excerpt.trim().length > 0);
+
+  const summary =
+    sourceAbstracts.length > 0
+      ? `Compression snapshot over ${sourceAbstracts.length} source(s): ${sourceAbstracts
+          .slice(0, 4)
+          .map((source) => source.source)
+          .join(", ")}.`
+      : "Compression snapshot has no extracted source abstracts yet.";
+
+  return {
+    summary,
+    sourceAbstracts,
+    criticalSourceContexts,
+    synthesisNotes: [],
+    sourceCount: sources.length,
+    quoteCount: sources.reduce((sum, source) => sum + source.quotes.length, 0),
+  };
 }
 
 function mapStopReasonFromGapAnalysis(output: GapAnalysisOutput): ResearchLoopStopReason {
@@ -499,7 +800,7 @@ function applyQuestionUpdates(input: {
   updates: Array<{
     id: string;
     status: QuestionStatus;
-    evidence: Array<z.infer<typeof QuestionEvidenceSchema>>;
+    evidence: QuestionEvidence[];
     confidence?: number;
   }>;
   iteration: number;
@@ -562,20 +863,34 @@ export async function runResearchLoop(input: {
   const initialPlan =
     (await input.services.objectStore.getJson<unknown>(initialPlanKey)) ??
     (await input.services.objectStore.getJson<unknown>(runPlanKey(input.runId)));
-  const parsedPlan = initialPlan ? InitialPlanSchema.safeParse(initialPlan).success
-    ? InitialPlanSchema.parse(initialPlan)
-    : InitialPlanSchema.parse({})
-    : InitialPlanSchema.parse({});
+  const parsedPlan = (() => {
+    if (!initialPlan) return InitialPlanSchema.parse({});
+    const parsed = InitialPlanSchema.safeParse(initialPlan);
+    return parsed.success ? parsed.data : InitialPlanSchema.parse({});
+  })();
   const initialQueries = dedupeStrings(parsedPlan.queries.length ? parsedPlan.queries : [input.prompt]);
+  const initialOutlinePlan =
+    coerceOutlinePlan(
+      (input.checkpoint as { outlinePlan?: unknown }).outlinePlan ??
+        parsedPlan.outlinePlan ??
+        null
+    ) ?? null;
 
   const baseState = defaultLoopCheckpoint({
     enabled: input.loopConfig.enabled,
     config: input.loopConfig,
     initialQueries,
+    ...(initialOutlinePlan ? { initialOutlinePlan } : {}),
   });
 
   const loopState = coerceLoopCheckpointState((input.checkpoint as { researchLoop?: unknown }).researchLoop, baseState);
   (input.checkpoint as { researchLoop?: ResearchLoopCheckpointState }).researchLoop = loopState;
+  if (loopState.currentOutlinePlan) {
+    (input.checkpoint as { outlinePlan?: OutlinePlan }).outlinePlan = loopState.currentOutlinePlan;
+  } else if (initialOutlinePlan) {
+    loopState.currentOutlinePlan = initialOutlinePlan;
+    (input.checkpoint as { outlinePlan?: OutlinePlan }).outlinePlan = initialOutlinePlan;
+  }
 
   if (!loopState.enabled) {
     return { stopReason: "gap_analysis_stop", mode: "incremental" };
@@ -622,7 +937,15 @@ export async function runResearchLoop(input: {
 
   const ensureIterationEntry = (iteration: number): ResearchLoopIterationState => {
     const existingEntry = loopState.iterations.find((it) => it.iteration === iteration);
-    if (existingEntry) return existingEntry;
+    if (existingEntry) {
+      if (!existingEntry.artifacts.compressionKey) {
+        existingEntry.artifacts.compressionKey = iterationCompressionKey(input.runId, iteration);
+      }
+      if (!existingEntry.artifacts.gapDiagnosticsKey) {
+        existingEntry.artifacts.gapDiagnosticsKey = iterationGapDiagnosticsKey(input.runId, iteration);
+      }
+      return existingEntry;
+    }
     const mode = selectOperationalMode(loopState);
     const entry: ResearchLoopIterationState = {
       iteration,
@@ -635,13 +958,11 @@ export async function runResearchLoop(input: {
       netNewSources: 0,
       artifacts: {
         planKey: iterationPlanKey(input.runId, iteration),
+        outlinePlanKey: iterationOutlinePlanKey(input.runId, iteration),
+        compressionKey: iterationCompressionKey(input.runId, iteration),
         retrievalKey: iterationRetrievalKey(input.runId, iteration),
-        synthesisKey: iterationSynthesisKey(input.runId, iteration),
-        citationMapKey: iterationCitationMapKey(input.runId, iteration),
-        verificationJsonKey: iterationVerificationJsonKey(input.runId, iteration),
-        verificationMarkdownKey: iterationVerificationMarkdownKey(input.runId, iteration),
-        reviewKey: iterationReviewKey(input.runId, iteration),
         gapAnalysisKey: iterationGapAnalysisKey(input.runId, iteration),
+        gapDiagnosticsKey: iterationGapDiagnosticsKey(input.runId, iteration),
       },
     };
     loopState.iterations.push(entry);
@@ -650,6 +971,11 @@ export async function runResearchLoop(input: {
 
   const persistCheckpoint = async (): Promise<void> => {
     await input.services.store.updateRun({ runId: input.runId, state: input.checkpoint });
+    if (loopState.currentOutlinePlan) {
+      await input.services.objectStore
+        .putJson(runOutlinePlanKey(input.runId), loopState.currentOutlinePlan)
+        .catch(() => {});
+    }
   };
 
   const persistImmutableCheckpoint = async (opts: {
@@ -670,6 +996,7 @@ export async function runResearchLoop(input: {
       seenUrls: loopState.seenUrls,
       seenQueries: loopState.seenQueries,
       questionGraph,
+      outlinePlan: loopState.currentOutlinePlan ?? null,
       synthesisState,
       sourceArtifacts: (opts.sources ?? []).map((s) => ({
         label: s.label,
@@ -714,7 +1041,20 @@ export async function runResearchLoop(input: {
     }
   };
 
-  const persistIterationPlanVersion = async (iterationEntry: ResearchLoopIterationState, gap: GapAnalysisOutput, report: VerificationReport, review: IterationReviewOutput): Promise<void> => {
+  const persistIterationPlanVersion = async (
+    iterationEntry: ResearchLoopIterationState,
+    gap: GapAnalysisOutput,
+    compression: IterationCompression
+  ): Promise<void> => {
+    const effectiveOutlinePlan =
+      coerceOutlinePlan(gap.outlinePlan, { fallback: loopState.currentOutlinePlan ?? null }) ??
+      loopState.currentOutlinePlan ??
+      null;
+    if (effectiveOutlinePlan) {
+      loopState.currentOutlinePlan = effectiveOutlinePlan;
+      (input.checkpoint as { outlinePlan?: OutlinePlan }).outlinePlan = effectiveOutlinePlan;
+    }
+
     const payload = {
       version: 1,
       runId: input.runId,
@@ -727,26 +1067,30 @@ export async function runResearchLoop(input: {
         tasks: iterationEntry.tasks,
       },
       outputs: {
+        compression: {
+          summary: compression.summary,
+          sourceCount: compression.sourceCount,
+          quoteCount: compression.quoteCount,
+          sourceAbstractCount: compression.sourceAbstracts.length,
+          criticalContextCount: compression.criticalSourceContexts.length,
+          synthesisNotes: compression.synthesisNotes.slice(0, 8),
+        },
         questionUpdates: gap.questionUpdates ?? [],
         nextQueries: gap.nextQueries,
         nextTasks: gap.nextTasks,
         stop: gap.stop,
         stopReason: gap.stopReason ?? null,
         planNotes: gap.planNotes ?? [],
-      },
-      verification: {
-        ok: report.ok,
-        coverage: report.coverage,
-        topIssues: summarizeTopIssues(report, 8),
-      },
-      reviewer: {
-        verdict: review.verdict,
-        missingEvidence: review.missingEvidence,
-        requestedRevisions: review.requestedRevisions,
-        confidenceRisk: review.confidenceRisk,
+        outlinePlan: effectiveOutlinePlan,
       },
     };
     await input.services.objectStore.putJson(iterationEntry.artifacts.planKey, payload);
+    if (effectiveOutlinePlan) {
+      await input.services.objectStore.putJson(
+        iterationEntry.artifacts.outlinePlanKey,
+        effectiveOutlinePlan
+      );
+    }
     if (!loopState.planVersionKeys.includes(iterationEntry.artifacts.planKey)) {
       loopState.planVersionKeys.push(iterationEntry.artifacts.planKey);
     }
@@ -758,15 +1102,16 @@ export async function runResearchLoop(input: {
       level: "info",
       phase: "retrieve",
       eventType: "research_loop_started",
-      message: `Research loop started (enabled=true, maxIterations=${loopState.maxIterations}, sourcesPerIteration=${sourcesPerIteration}, mode=${loopState.modeSetting})`,
-      data: {
-        enabled: true,
-        maxIterations: loopState.maxIterations,
-        sourcesPerIteration,
-        modeSetting: loopState.modeSetting,
-      },
-    })
-    .catch(() => {});
+        message: `Research loop started (enabled=true, maxIterations=${loopState.maxIterations}, sourcesPerIteration=${sourcesPerIteration}, mode=${loopState.modeSetting})`,
+        data: {
+          enabled: true,
+          maxIterations: loopState.maxIterations,
+          sourcesPerIteration,
+          modeSetting: loopState.modeSetting,
+          dynamicOutlineEnabled: loopState.dynamicOutlineEnabled,
+        },
+      })
+      .catch(() => {});
 
   while (!loopState.stopReason && loopState.iterationCountCompleted < loopState.maxIterations) {
     existing = normalizeSources(await input.services.store.listSources(input.runId));
@@ -829,15 +1174,38 @@ export async function runResearchLoop(input: {
       .catch(() => {});
 
     const retrievalKey = iterationEntry.artifacts.retrievalKey;
+    const taskFallback = deriveQueriesFromTasks({
+      tasks: iterationEntry.tasks,
+      maxQueries: 8,
+    });
+    const retrievalQueries =
+      iterationEntry.queries.length > 0 ? iterationEntry.queries : taskFallback.queries;
+    await input.services.store
+      .addRunEvent({
+        runId: input.runId,
+        level: "debug",
+        phase: "retrieve",
+        eventType: "research_iteration_query_selection",
+        message: `Iteration ${iterationEntry.iteration} query selection`,
+        data: {
+          iteration: iterationEntry.iteration,
+          nextQueryCount: iterationEntry.queries.length,
+          nextTaskCount: iterationEntry.tasks.length,
+          usedTaskFallback: iterationEntry.queries.length === 0,
+          derivedTaskQueryCount: taskFallback.queries.length,
+          filteredTaskCount: taskFallback.filteredTaskCount,
+          retrievalQueryCount: retrievalQueries.length > 0 ? retrievalQueries.length : initialQueries.length,
+        },
+      })
+      .catch(() => {});
     const retrieval =
       (await input.services.objectStore.getJson<RetrievalOutput>(retrievalKey)) ??
       (await (async () => {
-        const combinedQueries = dedupeStrings([...iterationEntry.queries, ...iterationEntry.tasks]);
         const result = await input.steps.retrieve({
           runId: input.runId,
           userId: input.userId,
           budgets: input.budgets,
-          queries: combinedQueries.length ? combinedQueries : initialQueries,
+          queries: retrievalQueries.length ? retrievalQueries : initialQueries,
           search: input.services.search,
           store: input.services.store,
           maxSelectedUrls: perIterationLimit,
@@ -910,183 +1278,73 @@ export async function runResearchLoop(input: {
       store: input.services.store,
       objectStore: input.services.objectStore,
     });
-    const promptSources = allLabeledSources.filter((s) => iterationEntry.sourceIds.includes(s.sourceId));
-
-    const previousSynthesis =
-      loopState.lastSynthesisKey
-        ? await input.services.objectStore.getJson<SynthesisOutput>(loopState.lastSynthesisKey)
-        : null;
-
-    const fullContextRequested = (input.loopConfig as { fullContext?: boolean }).fullContext === true;
-    const contextBudgetTokens = Math.max(
-      0,
-      input.synthesis.contextWindowTokens - Math.min(10_000, input.synthesis.maxOutputTokens) - 2_048
-    );
-    const fullContextActive = fullContextRequested && contextBudgetTokens >= 50_000;
-
-    const synthesisSources = fullContextActive
-      ? allLabeledSources
-      : promptSources.length
-        ? promptSources
-        : allLabeledSources;
-
-    const interimSynthesis = await input.steps.synthesize({
-      runId: input.runId,
-      userId: input.userId,
-      prompt: input.prompt,
-      sources: synthesisSources,
-      citationPolicy: input.citationPolicy,
-      provider: input.services.modelProvider,
-      model: input.models.synthesizer,
-      thinkingMode: input.thinkingMode,
-      maxInputTokens: input.synthesis.maxInputTokens,
-      maxOutputTokens: input.synthesis.maxOutputTokens,
-      requestedMaxInputTokens: input.synthesis.requestedMaxInputTokens,
-      requestedMaxOutputTokens: input.synthesis.requestedMaxOutputTokens,
-      synthesisContextWindowTokens: input.synthesis.contextWindowTokens,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-      checkpoint: input.checkpoint,
-      reviewPolicy: "skip",
-      ...(!fullContextActive && previousSynthesis ? { previousSynthesis } : {}),
-    });
-
-    await input.services.objectStore.putJson(iterationEntry.artifacts.synthesisKey, interimSynthesis);
-    loopState.lastSynthesisKey = iterationEntry.artifacts.synthesisKey;
+    const compressionKey = iterationEntry.artifacts.compressionKey;
+    const compression =
+      (await input.services.objectStore.getJson<IterationCompression>(compressionKey)) ??
+      (await (async () => {
+        if (input.steps.compress) {
+          return input.steps.compress({
+            runId: input.runId,
+            userId: input.userId,
+            prompt: input.prompt,
+            sources: allLabeledSources,
+            citationPolicy: input.citationPolicy,
+            provider: input.services.modelProvider,
+            model: input.models.synthesizer,
+            thinkingMode: input.thinkingMode,
+            store: input.services.store,
+            objectStore: input.services.objectStore,
+            checkpoint: input.checkpoint,
+          });
+        }
+        return buildDeterministicCompression(allLabeledSources);
+      })());
+    await input.services.objectStore.putJson(compressionKey, compression);
+    loopState.lastCompressionKey = compressionKey;
     (input.checkpoint as { synthesisState?: unknown }).synthesisState = {
-      snapshotKey: iterationEntry.artifacts.synthesisKey,
-      summary: interimSynthesis.summary,
+      snapshotKey: compressionKey,
+      summary: compression.summary,
     };
     await persistCheckpoint();
-
-    if (iterationEntry.iteration === 1 || fullContextRequested) {
-      await input.services.store
-        .addRunEvent({
-          runId: input.runId,
-          level: "info",
-          phase: "synthesize",
-          eventType: "synthesis_context_mode",
-          message: `Synthesis context mode: ${fullContextActive ? "full-context" : "summary+delta"} (contextBudgetTokens=${contextBudgetTokens})`,
-          data: {
-            iteration: iterationEntry.iteration,
-            fullContextRequested,
-            fullContextActive,
-            contextBudgetTokens,
-            sourceCount: synthesisSources.length,
-            promptSourceCount: promptSources.length,
-            totalSourceCount: allLabeledSources.length,
-          },
-        })
-        .catch(() => {});
-    }
-
-    const citationMap = buildCitationMap({
-      runId: input.runId,
-      policy: input.citationPolicy,
-      synthesis: interimSynthesis,
-      sources: allLabeledSources,
-    });
-
-    const evidenceBySourceId: Record<string, ExtractedEvidence | undefined> = {};
-    for (const source of allLabeledSources) {
-      const ev = await input.services.objectStore.getJson<ExtractedEvidence>(
-        sourceEvidenceKey(input.runId, source.sourceId)
-      );
-      evidenceBySourceId[source.sourceId] = ev ?? undefined;
-    }
-
-    const { report, markdown } = validateCitations({
-      runId: input.runId,
-      policy: input.citationPolicy,
-      citationMap,
-      evidenceBySourceId,
-    });
-
-    await input.services.objectStore.putJson(iterationEntry.artifacts.citationMapKey, citationMap);
-    await input.services.objectStore.putJson(iterationEntry.artifacts.verificationJsonKey, report);
-    await input.services.objectStore.putText(iterationEntry.artifacts.verificationMarkdownKey, markdown);
-
-    let reviewOutput: IterationReviewOutput = {
-      verdict: "accept",
-      unsupportedConclusions: [],
-      missingEvidence: [],
-      requestedRevisions: [],
-    };
-    if (input.services.modelProvider) {
-      const review = await input.steps.review({
-        runId: input.runId,
-        userId: input.userId,
-        prompt: input.prompt,
-        sources: allLabeledSources,
-        synthesis: interimSynthesis,
-        provider: input.services.modelProvider,
-        model: input.models.verifier,
-        thinkingMode: input.thinkingMode,
-        store: input.services.store,
-        objectStore: input.services.objectStore,
-        checkpoint: input.checkpoint,
-      });
-      reviewOutput = ReviewOutputSchema.parse(review);
-    }
-
-    await input.services.objectStore.putJson(iterationEntry.artifacts.reviewKey, reviewOutput);
-    iterationEntry.reviewVerdict = reviewOutput.verdict;
 
     await input.services.store
       .addRunEvent({
         runId: input.runId,
         level: "info",
-        phase: "verify",
-        eventType: "research_iteration_review_completed",
-        message: `Iteration ${iterationEntry.iteration} review: ${reviewOutput.verdict}`,
+        phase: "synthesize",
+        eventType: "research_iteration_compression_completed",
+        message: `Iteration ${iterationEntry.iteration} compression completed`,
         data: {
           iteration: iterationEntry.iteration,
-          verdict: reviewOutput.verdict,
-          missingEvidence: reviewOutput.missingEvidence.slice(0, 4),
-          requestedRevisions: reviewOutput.requestedRevisions.slice(0, 4),
+          sourceCount: compression.sourceCount,
+          quoteCount: compression.quoteCount,
+          sourceAbstractCount: compression.sourceAbstracts.length,
+          criticalContextCount: compression.criticalSourceContexts.length,
         },
       })
       .catch(() => {});
 
-    if (reviewOutput.verdict === "reject") {
-      loopState.rejectCount += 1;
-      if (
-        loopState.modeSetting === "auto" &&
-        loopState.mode !== "hybrid" &&
-        loopState.rejectCount >= loopState.switchToHybridAfterRejects
-      ) {
-        loopState.mode = "hybrid";
-        await input.services.store
-          .addRunEvent({
-            runId: input.runId,
-            level: "warn",
-            phase: "synthesize",
-            eventType: "research_loop_mode_switched",
-            message: `Switching to hybrid mode after ${loopState.rejectCount} reviewer rejects`,
-            data: {
-              iteration: iterationEntry.iteration,
-              rejectCount: loopState.rejectCount,
-              switchToHybridAfterRejects: loopState.switchToHybridAfterRejects,
-            },
-          })
-          .catch(() => {});
-      }
-    }
-
     const gapKey = iterationEntry.artifacts.gapAnalysisKey;
+    const gapDiagnosticsKey = iterationEntry.artifacts.gapDiagnosticsKey;
+    let gapNormalizationDiagnostics =
+      (await input.services.objectStore.getJson<GapAnalysisNormalizationDiagnostics>(gapDiagnosticsKey)) ??
+      createGapAnalysisNormalizationDiagnostics();
+
     const gap =
       (await input.services.objectStore.getJson<GapAnalysisOutput>(gapKey)) ??
       (await (async () => {
         if (!input.services.modelProvider) {
-          const normalized = GapAnalysisOutputSchema.parse(
-            normalizeGapAnalysisOutput({
-              nextQueries: [],
-              nextTasks: [],
-              stop: true,
-              stopReason: "no_model_provider",
-            }),
-          );
+          const normalizedResult = normalizeGapAnalysisOutput({
+            questionUpdates: [],
+            nextQueries: [],
+            nextTasks: [],
+            stop: true,
+            stopReason: "no_model_provider",
+          });
+          const normalized = GapAnalysisOutputSchema.parse(normalizedResult.value);
+          gapNormalizationDiagnostics = normalizedResult.diagnostics;
           await input.services.objectStore.putJson(gapKey, normalized);
+          await input.services.objectStore.putJson(gapDiagnosticsKey, gapNormalizationDiagnostics);
           return normalized;
         }
 
@@ -1121,29 +1379,36 @@ export async function runResearchLoop(input: {
               status: q.status,
               dependsOn: q.dependsOn,
             })),
-            interimSynthesis: {
-              summary: interimSynthesis.summary,
-              keyFindings: interimSynthesis.keyFindings.slice(0, 12),
-              unknowns: interimSynthesis.unknowns,
-              recommendations: interimSynthesis.recommendations ?? [],
-              negativeSpace: interimSynthesis.negativeSpace ?? null,
+            compression: {
+              summary: compression.summary,
+              sourceAbstracts: compression.sourceAbstracts.slice(0, 12).map((item) => ({
+                source: item.source,
+                methodology: item.methodology,
+                temporalContext: item.temporalContext,
+                dataTypes: item.dataTypes,
+                stakeholderPosition: item.stakeholderPosition,
+                representativeClaims: item.representativeClaims.slice(0, 4),
+                keyConstraints: item.keyConstraints.slice(0, 4),
+              })),
+              criticalSourceContexts: compression.criticalSourceContexts
+                .slice(0, 6)
+                .map((context) => ({
+                  source: context.source,
+                  reason: context.reason,
+                  excerpt: context.excerpt.slice(0, 1600),
+                })),
+              synthesisNotes: compression.synthesisNotes.slice(0, 12),
             },
+            outlinePlan:
+              loopState.dynamicOutlineEnabled && loopState.currentOutlinePlan
+                ? loopState.currentOutlinePlan
+                : null,
             sources: allLabeledSources.map((s) => ({
               source: s.label,
               url: s.url,
               title: s.title,
               publisher: s.publisher,
             })),
-            citationValidation: {
-              coverage: report.coverage,
-              topIssues: summarizeTopIssues(report, 12),
-            },
-            reviewer: {
-              verdict: reviewOutput.verdict,
-              missingEvidence: reviewOutput.missingEvidence.slice(0, 12),
-              requestedRevisions: reviewOutput.requestedRevisions.slice(0, 12),
-              confidenceRisk: reviewOutput.confidenceRisk,
-            },
             seen: {
               queries: Array.from(seenQueries).slice(-50),
             },
@@ -1163,35 +1428,150 @@ export async function runResearchLoop(input: {
               stopReason:
                 "questions_answered | diminishing_returns | budget_exhausted | no_new_sources | iteration_cap",
               planNotes: ["..."],
+              outlinePlan: {
+                version: 1,
+                rationale: "...",
+                sections: [
+                  {
+                    id: "summary",
+                    heading: "Summary",
+                    intent: "Short overview of the answer to the prompt.",
+                    dependsOnQuestionIds: [],
+                  },
+                ],
+                notes: ["..."],
+              },
             },
             constraints: {
               onlyUpdateUnblockedQuestions: true,
               maxNextQueries: 8,
               maxNextTasks: 8,
               dedupeAgainstSeenQueries: true,
+              dynamicOutlineEnabled: loopState.dynamicOutlineEnabled,
             },
           }),
         };
 
-        const parsed = await input.steps.callModelJsonLogged({
-          runId: input.runId,
-          userId: input.userId,
-          phase: "gap-analysis",
-          persona: "goal-directed-gap-analysis",
-          provider: input.services.modelProvider,
-          model: input.models.planner,
-          messages: [sys, user],
-          schema: GapAnalysisModelSchema,
-          reasoningEffort: input.thinkingMode,
-          store: input.services.store,
-          objectStore: input.services.objectStore,
-          checkpoint: input.checkpoint,
-          promptVersion: "gap-analysis.goal-directed.v1",
-        });
-        const normalized = GapAnalysisOutputSchema.parse(normalizeGapAnalysisOutput(parsed));
-        await input.services.objectStore.putJson(gapKey, normalized);
-        return normalized;
+        try {
+          const parsed = await input.steps.callModelJsonLogged({
+            runId: input.runId,
+            userId: input.userId,
+            phase: "gap-analysis",
+            persona: "goal-directed-gap-analysis",
+            provider: input.services.modelProvider,
+            model: input.models.planner,
+            messages: [sys, user],
+            schema: GapAnalysisModelSchema,
+            reasoningEffort: input.thinkingMode,
+            store: input.services.store,
+            objectStore: input.services.objectStore,
+            checkpoint: input.checkpoint,
+            promptVersion: "gap-analysis.goal-directed.v1",
+          });
+
+          const normalizedResult = normalizeGapAnalysisOutput(parsed);
+          const normalized = GapAnalysisOutputSchema.parse(normalizedResult.value);
+          gapNormalizationDiagnostics = normalizedResult.diagnostics;
+          await input.services.objectStore.putJson(gapKey, normalized);
+          await input.services.objectStore.putJson(gapDiagnosticsKey, gapNormalizationDiagnostics);
+
+          if (gapNormalizationDiagnostics.changed) {
+            await input.services.store
+              .addRunEvent({
+                runId: input.runId,
+                level: "info",
+                phase: "plan",
+                eventType: "gap_analysis_normalized",
+                message: `Iteration ${iterationEntry.iteration} normalized gap-analysis payload`,
+                data: {
+                  iteration: iterationEntry.iteration,
+                  diagnostics: gapNormalizationDiagnostics,
+                },
+              })
+              .catch(() => {});
+          }
+
+          return normalized;
+        } catch (error) {
+          const normalizedError =
+            error instanceof Error
+              ? { name: error.name, message: error.message }
+              : { name: "UnknownError", message: String(error) };
+          const fallbackResult = normalizeGapAnalysisOutput({
+            questionUpdates: [],
+            nextQueries: [],
+            nextTasks: [],
+            stop: true,
+            stopReason: "gap_analysis_schema_error",
+            planNotes: [
+              `Gap analysis failed schema validation: ${normalizedError.name}: ${normalizedError.message.slice(0, 320)}`,
+            ],
+            ...(loopState.currentOutlinePlan ? { outlinePlan: loopState.currentOutlinePlan } : {}),
+          });
+          const fallback = GapAnalysisOutputSchema.parse(fallbackResult.value);
+          gapNormalizationDiagnostics = {
+            ...fallbackResult.diagnostics,
+            changed: true,
+            fallbackUsed: true,
+            parseError: normalizedError,
+          };
+          await input.services.objectStore.putJson(gapKey, fallback);
+          await input.services.objectStore.putJson(gapDiagnosticsKey, gapNormalizationDiagnostics);
+          await input.services.store
+            .addRunEvent({
+              runId: input.runId,
+              level: "warn",
+              phase: "plan",
+              eventType: "gap_analysis_fallback_used",
+              message: `Iteration ${iterationEntry.iteration} used gap-analysis fallback after schema failure`,
+              data: {
+                iteration: iterationEntry.iteration,
+                error: normalizedError,
+                diagnostics: gapNormalizationDiagnostics,
+              },
+            })
+            .catch(() => {});
+          return fallback;
+        }
       })());
+
+    if (loopState.dynamicOutlineEnabled) {
+      const nextOutlinePlan = coerceOutlinePlan(gap.outlinePlan, {
+        fallback: loopState.currentOutlinePlan ?? null,
+      });
+      if (nextOutlinePlan) {
+        const previousSerialized = loopState.currentOutlinePlan
+          ? JSON.stringify(loopState.currentOutlinePlan)
+          : "";
+        const nextSerialized = JSON.stringify(nextOutlinePlan);
+        const changed = previousSerialized !== nextSerialized;
+        loopState.currentOutlinePlan = nextOutlinePlan;
+        (input.checkpoint as { outlinePlan?: OutlinePlan }).outlinePlan = nextOutlinePlan;
+        await input.services.objectStore
+          .putJson(iterationEntry.artifacts.outlinePlanKey, nextOutlinePlan)
+          .catch(() => {});
+        if (changed) {
+          await input.services.store
+            .addRunEvent({
+              runId: input.runId,
+              level: "info",
+              phase: "plan",
+              eventType: "outline_plan_updated",
+              message: `Iteration ${iterationEntry.iteration} updated dynamic outline plan`,
+              data: {
+                iteration: iterationEntry.iteration,
+                sections: nextOutlinePlan.sections.map((section) => ({
+                  id: section.id,
+                  heading: section.heading,
+                  dependsOnQuestionIds: section.dependsOnQuestionIds,
+                })),
+                notes: nextOutlinePlan.notes,
+              },
+            })
+            .catch(() => {});
+        }
+      }
+    }
 
     const questionGraphBeforeUpdate = questionGraph;
     const updateDiagnostics: {
@@ -1268,11 +1648,33 @@ export async function runResearchLoop(input: {
     }
 
     // Heuristic: each unblocked open question gets at most `maxFocusRoundsPerQuestion` iterations.
-    // If it still isn't answered after that focus window, mark it "unanswerable" so dependents can unblock.
+    // At the focus cap, resolve deterministically:
+    // - confidence >= 0.5 with source-backed evidence => answered
+    // - otherwise => unanswerable (to unblock dependents)
     const isResolved = (status: QuestionStatus) => status === "answered" || status === "unanswerable";
     const unblockedIdsForStreak = new Set(computeUnblockedQuestions(questionGraph).map((q) => q.id));
     const focusStreaks = loopState.unansweredStreaks;
-    const newlyUnanswerable: Array<{ id: string; streak: number; priorStatus: QuestionStatus; confidence: number | null; evidenceCount: number }> = [];
+    type FocusCapUnanswerableReason =
+      | "focus_round_cap_low_confidence"
+      | "focus_round_cap_missing_source_evidence";
+    const newlyAnsweredAfterCap: Array<{
+      id: string;
+      streak: number;
+      priorStatus: QuestionStatus;
+      confidence: number;
+      evidenceCount: number;
+      hasSourceEvidence: boolean;
+      reason: "focus_round_cap_confident_with_source";
+    }> = [];
+    const newlyUnanswerableAfterCap: Array<{
+      id: string;
+      streak: number;
+      priorStatus: QuestionStatus;
+      confidence: number;
+      evidenceCount: number;
+      hasSourceEvidence: boolean;
+      reason: FocusCapUnanswerableReason;
+    }> = [];
 
     for (const q of questionGraph.questions) {
       const isCandidate =
@@ -1280,26 +1682,74 @@ export async function runResearchLoop(input: {
 
       const nextStreak = isCandidate ? (focusStreaks[q.id] ?? 0) + 1 : 0;
       focusStreaks[q.id] = nextStreak;
+      const confidenceForThreshold = q.confidence ?? 0;
+
+      const evidenceCount = Array.isArray(q.evidence) ? q.evidence.length : 0;
+      const hasSourceEvidence = Array.isArray(q.evidence)
+        ? q.evidence.some((e) => typeof e.source === "string" && e.source.trim().length > 0)
+        : false;
 
       if (isCandidate && nextStreak >= maxFocusRoundsPerQuestion) {
-        newlyUnanswerable.push({
-          id: q.id,
-          streak: nextStreak,
-          priorStatus: q.status,
-          confidence: q.confidence ?? null,
-          evidenceCount: q.evidence?.length ?? 0,
-        });
+        if (confidenceForThreshold >= 0.5 && hasSourceEvidence) {
+          newlyAnsweredAfterCap.push({
+            id: q.id,
+            streak: nextStreak,
+            priorStatus: q.status,
+            confidence: confidenceForThreshold,
+            evidenceCount,
+            hasSourceEvidence,
+            reason: "focus_round_cap_confident_with_source",
+          });
+        } else {
+          newlyUnanswerableAfterCap.push({
+            id: q.id,
+            streak: nextStreak,
+            priorStatus: q.status,
+            confidence: confidenceForThreshold,
+            evidenceCount,
+            hasSourceEvidence,
+            reason:
+              confidenceForThreshold < 0.5
+                ? "focus_round_cap_low_confidence"
+                : "focus_round_cap_missing_source_evidence",
+          });
+        }
       }
     }
 
-    if (newlyUnanswerable.length > 0) {
-      const byId = new Map(newlyUnanswerable.map((u) => [u.id, u]));
+    if (newlyAnsweredAfterCap.length > 0 || newlyUnanswerableAfterCap.length > 0) {
+      const answeredById = new Map(newlyAnsweredAfterCap.map((u) => [u.id, u]));
+      const unanswerableById = new Map(newlyUnanswerableAfterCap.map((u) => [u.id, u]));
       questionGraph = validateQuestionGraph({
         ...questionGraph,
         questions: questionGraph.questions.map((q) => {
-          const match = byId.get(q.id);
-          if (!match) return q;
+          const answeredMatch = answeredById.get(q.id);
+          if (answeredMatch) {
+            const existingEvidence = Array.isArray(q.evidence) ? q.evidence : [];
+            return {
+              ...q,
+              status: "answered",
+              evidence: [
+                ...existingEvidence,
+                {
+                  note:
+                    `Focus cap reached: after ${answeredMatch.streak} iteration(s) this question is still ${answeredMatch.priorStatus}` +
+                    ` (confidence=${answeredMatch.confidence.toFixed(2)})` +
+                    ` with ${answeredMatch.evidenceCount} evidence item(s). Marked answered because confidence >= 0.50` +
+                    ` and source-backed evidence is present.`,
+                },
+              ],
+              updatedAtIteration: iterationEntry.iteration,
+            };
+          }
+
+          const unanswerableMatch = unanswerableById.get(q.id);
+          if (!unanswerableMatch) return q;
           const existingEvidence = Array.isArray(q.evidence) ? q.evidence : [];
+          const unanswerableReasonText =
+            unanswerableMatch.reason === "focus_round_cap_low_confidence"
+              ? "confidence < 0.50"
+              : "confidence >= 0.50 but source-backed evidence is missing";
           return {
             ...q,
             status: "unanswerable",
@@ -1307,9 +1757,10 @@ export async function runResearchLoop(input: {
               ...existingEvidence,
               {
                 note:
-                  `Focus cap reached: after ${match.streak} iteration(s) this question is still ${match.priorStatus}` +
-                  (match.confidence !== null ? ` (confidence=${match.confidence.toFixed(2)})` : "") +
-                  ` with ${match.evidenceCount} evidence item(s). Marked unanswerable to unblock dependents.`,
+                  `Focus cap reached: after ${unanswerableMatch.streak} iteration(s) this question is still ${unanswerableMatch.priorStatus}` +
+                  ` (confidence=${unanswerableMatch.confidence.toFixed(2)})` +
+                  ` with ${unanswerableMatch.evidenceCount} evidence item(s). Marked unanswerable because ${unanswerableReasonText}` +
+                  ` to unblock dependents.`,
               },
             ],
             updatedAtIteration: iterationEntry.iteration,
@@ -1317,6 +1768,49 @@ export async function runResearchLoop(input: {
         }),
       });
       (input.checkpoint as { questionGraph?: QuestionGraph }).questionGraph = questionGraph;
+      await persistCheckpoint();
+    }
+
+    if (newlyAnsweredAfterCap.length > 0) {
+      await input.services.store
+        .addRunEvent({
+          runId: input.runId,
+          level: "info",
+          phase: "plan",
+          eventType: "question_marked_answered_after_focus_cap",
+          message: `Marked ${newlyAnsweredAfterCap.length} question(s) as answered after focus cap`,
+          data: {
+            iteration: iterationEntry.iteration,
+            maxFocusRoundsPerQuestion,
+            reason: "focus_round_cap_confident_with_source",
+            confidenceThreshold: 0.5,
+            questions: newlyAnsweredAfterCap.map((q) => ({
+              id: q.id,
+              focusStreak: q.streak,
+              priorStatus: q.priorStatus,
+              confidence: q.confidence,
+              evidenceCount: q.evidenceCount,
+              hasSourceEvidence: q.hasSourceEvidence,
+              reason: q.reason,
+            })),
+          },
+        })
+        .catch(() => {});
+    }
+
+    if (newlyUnanswerableAfterCap.length > 0) {
+      const lowConfidenceCount = newlyUnanswerableAfterCap.filter(
+        (q) => q.reason === "focus_round_cap_low_confidence"
+      ).length;
+      const missingSourceEvidenceCount = newlyUnanswerableAfterCap.filter(
+        (q) => q.reason === "focus_round_cap_missing_source_evidence"
+      ).length;
+      const reason =
+        lowConfidenceCount > 0 && missingSourceEvidenceCount > 0
+          ? "mixed"
+          : lowConfidenceCount > 0
+            ? "focus_round_cap_low_confidence"
+            : "focus_round_cap_missing_source_evidence";
 
       await input.services.store
         .addRunEvent({
@@ -1324,17 +1818,24 @@ export async function runResearchLoop(input: {
           level: "info",
           phase: "plan",
           eventType: "question_marked_unanswerable",
-          message: `Marked ${newlyUnanswerable.length} question(s) as unanswerable after focus cap`,
+          message: `Marked ${newlyUnanswerableAfterCap.length} question(s) as unanswerable after focus cap`,
           data: {
             iteration: iterationEntry.iteration,
             maxFocusRoundsPerQuestion,
-            reason: "focus_round_cap",
-            questions: newlyUnanswerable.map((q) => ({
+            reason,
+            confidenceThreshold: 0.5,
+            reasons: {
+              focus_round_cap_low_confidence: lowConfidenceCount,
+              focus_round_cap_missing_source_evidence: missingSourceEvidenceCount,
+            },
+            questions: newlyUnanswerableAfterCap.map((q) => ({
               id: q.id,
               focusStreak: q.streak,
               priorStatus: q.priorStatus,
               confidence: q.confidence,
               evidenceCount: q.evidenceCount,
+              hasSourceEvidence: q.hasSourceEvidence,
+              reason: q.reason,
             })),
           },
         })
@@ -1385,6 +1886,7 @@ export async function runResearchLoop(input: {
           `unblockedAnswered=${unblockedCounts.answered}/${unblockedCounts.total} ` +
           `unblockedOpen=${openUnblocked.length}/${unblockedCounts.total} ` +
           `nextQueries=${gap.nextQueries.length} nextTasks=${gap.nextTasks.length}` +
+          (gapNormalizationDiagnostics.fallbackUsed ? " fallbackUsed=true" : "") +
           (openUnblockedLabels.length ? `\n  Open unblocked: ${openUnblockedLabels.join(", ")}` : ""),
         data: {
           iteration: iterationEntry.iteration,
@@ -1409,6 +1911,7 @@ export async function runResearchLoop(input: {
           nextQueries: gap.nextQueries.slice(0, 6),
           nextTasks: gap.nextTasks.slice(0, 6),
           planNotes: gap.planNotes?.slice(0, 6) ?? [],
+          gapDiagnostics: gapNormalizationDiagnostics,
         },
       })
       .catch(() => {});
@@ -1477,6 +1980,7 @@ export async function runResearchLoop(input: {
             questionUpdatesApplied: updateDiagnostics.applied,
             questionUpdatesIgnored: updateDiagnostics.ignored,
             planNotes: gap.planNotes ?? [],
+            gapDiagnostics: gapNormalizationDiagnostics,
           },
         })
         .catch(() => {});
@@ -1501,7 +2005,7 @@ export async function runResearchLoop(input: {
     const lowValue = iterationEntry.netNewSources <= 1;
     loopState.lowValueIterationStreak = lowValue ? loopState.lowValueIterationStreak + 1 : 0;
 
-    await persistIterationPlanVersion(iterationEntry, gap, report, reviewOutput);
+    await persistIterationPlanVersion(iterationEntry, gap, compression);
 
     let shouldStop = false;
     let stopReason: ResearchLoopStopReason | undefined;
@@ -1561,116 +2065,6 @@ export async function runResearchLoop(input: {
 
   const finalStopReason = loopState.stopReason ?? "iteration_cap";
   const finalMode = selectOperationalMode(loopState);
-
-  let finalSynthesisWritten = false;
-  if (finalMode === "hybrid") {
-    const allLabeledSources = await input.steps.loadLabeledSources({
-      runId: input.runId,
-      checkpoint: input.checkpoint,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-    });
-    const finalSynthesis = await input.steps.synthesize({
-      runId: input.runId,
-      userId: input.userId,
-      prompt: input.prompt,
-      sources: allLabeledSources,
-      citationPolicy: input.citationPolicy,
-      provider: input.services.modelProvider,
-      model: input.models.synthesizer,
-      thinkingMode: input.thinkingMode,
-      maxInputTokens: input.synthesis.maxInputTokens,
-      maxOutputTokens: input.synthesis.maxOutputTokens,
-      requestedMaxInputTokens: input.synthesis.requestedMaxInputTokens,
-      requestedMaxOutputTokens: input.synthesis.requestedMaxOutputTokens,
-      synthesisContextWindowTokens: input.synthesis.contextWindowTokens,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-      checkpoint: input.checkpoint,
-      reviewPolicy: "skip",
-    });
-    const synthesisKey = runSynthesisKey(input.runId);
-    await input.services.objectStore.putJson(synthesisKey, finalSynthesis);
-    input.checkpoint.artifacts.synthesisKey = synthesisKey;
-
-    const finalReviewKey = runFinalSynthesisReviewKey(input.runId);
-    let finalReview: IterationReviewOutput = {
-      verdict: "accept",
-      unsupportedConclusions: [],
-      missingEvidence: [],
-      requestedRevisions: [],
-    };
-    if (input.services.modelProvider) {
-      finalReview = await input.steps.review({
-        runId: input.runId,
-        userId: input.userId,
-        prompt: input.prompt,
-        sources: allLabeledSources,
-        synthesis: finalSynthesis,
-        provider: input.services.modelProvider,
-        model: input.models.verifierStrong,
-        thinkingMode: input.thinkingMode,
-        store: input.services.store,
-        objectStore: input.services.objectStore,
-        checkpoint: input.checkpoint,
-      });
-    }
-    await input.services.objectStore.putJson(finalReviewKey, finalReview);
-    await input.services.store
-      .addRunEvent({
-        runId: input.runId,
-        level: "info",
-        phase: "verify",
-        eventType: "research_loop_final_synthesis_review_completed",
-        message: `Final full synthesis review: ${finalReview.verdict}`,
-        data: {
-          verdict: finalReview.verdict,
-          missingEvidence: finalReview.missingEvidence.slice(0, 4),
-          requestedRevisions: finalReview.requestedRevisions.slice(0, 4),
-        },
-      })
-      .catch(() => {});
-    finalSynthesisWritten = true;
-  } else if (loopState.lastSynthesisKey) {
-    const synthesis = await input.services.objectStore.getJson<SynthesisOutput>(loopState.lastSynthesisKey);
-    if (synthesis) {
-      const synthesisKey = runSynthesisKey(input.runId);
-      await input.services.objectStore.putJson(synthesisKey, synthesis);
-      input.checkpoint.artifacts.synthesisKey = synthesisKey;
-      finalSynthesisWritten = true;
-    }
-  }
-
-  if (!finalSynthesisWritten) {
-    const allLabeledSources = await input.steps.loadLabeledSources({
-      runId: input.runId,
-      checkpoint: input.checkpoint,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-    });
-    const synthesis = await input.steps.synthesize({
-      runId: input.runId,
-      userId: input.userId,
-      prompt: input.prompt,
-      sources: allLabeledSources,
-      citationPolicy: input.citationPolicy,
-      provider: input.services.modelProvider,
-      model: input.models.synthesizer,
-      thinkingMode: input.thinkingMode,
-      maxInputTokens: input.synthesis.maxInputTokens,
-      maxOutputTokens: input.synthesis.maxOutputTokens,
-      requestedMaxInputTokens: input.synthesis.requestedMaxInputTokens,
-      requestedMaxOutputTokens: input.synthesis.requestedMaxOutputTokens,
-      synthesisContextWindowTokens: input.synthesis.contextWindowTokens,
-      store: input.services.store,
-      objectStore: input.services.objectStore,
-      checkpoint: input.checkpoint,
-      reviewPolicy: "skip",
-    });
-    const synthesisKey = runSynthesisKey(input.runId);
-    await input.services.objectStore.putJson(synthesisKey, synthesis);
-    input.checkpoint.artifacts.synthesisKey = synthesisKey;
-  }
 
   await input.services.store
     .addRunEvent({

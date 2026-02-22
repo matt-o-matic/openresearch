@@ -11,6 +11,9 @@ import type { ModelProvider } from "./models.js";
 import {
   runCitationMapKey,
   runOutputKey,
+  runPlanKey,
+  runReportPlanKey,
+  runSynthesisKey,
   runVerificationMarkdownKey,
   runVerificationJsonKey,
   sourceEvidenceKey,
@@ -65,6 +68,44 @@ class MockModelProvider implements ModelProvider {
     }
 
     throw new Error(`Unhandled mock model request: ${user.slice(0, 80)}`);
+  }
+}
+
+class PlanOutlineCompatModelProvider extends MockModelProvider {
+  readonly name = "mock-plan-outline-compat";
+
+  async chat(req: Parameters<ModelProvider["chat"]>[0]) {
+    const user = req.messages.find((m) => m.role === "user")?.content ?? "";
+    if (user.includes("Generate a research plan")) {
+      return {
+        text: JSON.stringify({
+          subquestions: ["Identify key competitors", "Compare core differentiators"],
+          queries: ["techr2 competitors"],
+          outlinePlan: {
+            version: 2,
+            rationale: "Legacy payload used numeric question dependencies.",
+            sections: [
+              {
+                id: "summary",
+                heading: "Summary",
+                intent: "Provide an executive summary.",
+                dependsOnQuestionIds: [0, 1],
+              },
+              {
+                id: "comparison",
+                heading: "Competitive Comparison",
+                intent: "Compare TechR2 with alternatives.",
+                dependsOnQuestionIds: [1],
+              },
+            ],
+            notes: [" normalize outline dependencies "],
+          },
+        }),
+        usage: { inputTokens: 10, outputTokens: 22, costUsd: 0.01 },
+        raw: { mock: true },
+      };
+    }
+    return super.chat(req);
   }
 }
 
@@ -1162,6 +1203,153 @@ class LegacyPayloadCompatModelProvider implements ModelProvider {
   }
 }
 
+class SynthesisWritingCompatModelProvider implements ModelProvider {
+  readonly name = "mock-synthesis-writing-compat";
+  public synthesisCallCount = 0;
+  public reviewCallCount = 0;
+
+  async chat(req: Parameters<ModelProvider["chat"]>[0]) {
+    const user = req.messages.find((m) => m.role === "user")?.content ?? "";
+    if (user.includes("Generate a research plan")) {
+      return {
+        text: JSON.stringify({ subquestions: [], queries: ["compat query"] }),
+        usage: { inputTokens: 6, outputTokens: 10, costUsd: 0.01 },
+        raw: { mock: true },
+      };
+    }
+
+    if (user.includes('"reviewRequest"') || user.includes("Attack the report")) {
+      this.reviewCallCount += 1;
+      return {
+        text: JSON.stringify({
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        }),
+        usage: { inputTokens: 9, outputTokens: 14, costUsd: 0.01 },
+        raw: { mock: true },
+      };
+    }
+
+    this.synthesisCallCount += 1;
+    return {
+      text: JSON.stringify({
+        summary: {
+          bullets: [
+            {
+              text: "Object summary payload should be stringified and accepted in synthesis-writing compatibility mode.",
+            },
+          ],
+          rationale: "schema drift sample",
+        },
+        keyFindings: [
+          {
+            id: "F1",
+            text: "Compatibility shim should preserve valid findings and citations.",
+            citations: [{ source: "S1", quoteId: "Q1" }],
+          },
+        ],
+        contradictions: [{ id: "C1", text: "Object-form contradiction item." }],
+        recommendations: [
+          { id: "R1", text: "Object-form recommendation item." },
+          { id: "R2", text: "Second object recommendation item." },
+        ],
+        unknowns: [],
+      }),
+      usage: { inputTokens: 20, outputTokens: 80, costUsd: 0.02 },
+      raw: { mock: true },
+    };
+  }
+}
+
+class GapAnalysisCompatModelProvider implements ModelProvider {
+  readonly name = "mock-gap-analysis-compat";
+
+  async chat(req: Parameters<ModelProvider["chat"]>[0]) {
+    const user = req.messages.find((m) => m.role === "user")?.content ?? "";
+
+    if (user.includes("Generate a research plan")) {
+      return {
+        text: JSON.stringify({
+          subquestions: ["Assess available evidence."],
+          queries: ["compatibility shim test query"],
+        }),
+        usage: { inputTokens: 8, outputTokens: 12, costUsd: 0.01 },
+        raw: { mock: true },
+      };
+    }
+
+    if (user.includes('"task":"Goal-directed question tracking + next-step selection"')) {
+      return {
+        text: JSON.stringify({
+          questionUpdates: [
+            {
+              id: "q1",
+              status: "answered",
+              evidence: [{ source: "S1", quoteId: "   ", note: "Compatibility shim evidence" }],
+              confidence: 0.9,
+            },
+          ],
+          nextQueries: ["  next query  ", ""],
+          nextTasks: ["  next task  ", ""],
+          stop: true,
+          stopReason: "complete",
+          planNotes: ["  normalized note  ", ""],
+          outlinePlan: {
+            version: 2,
+            rationale: "Coerce to outline plan v1",
+            sections: [
+              {
+                id: "summary",
+                heading: "Summary",
+                intent: "Compatibility shim section",
+                dependsOnQuestionIds: [0, 1],
+              },
+            ],
+            notes: [],
+          },
+        }),
+        usage: { inputTokens: 20, outputTokens: 32, costUsd: 0.02 },
+        raw: { mock: true },
+      };
+    }
+
+    if (user.includes('"reviewRequest"') || user.includes("Attack the report")) {
+      return {
+        text: JSON.stringify({
+          verdict: "accept",
+          unsupportedConclusions: [],
+          missingEvidence: [],
+          requestedRevisions: [],
+        }),
+        usage: { inputTokens: 12, outputTokens: 18, costUsd: 0.02 },
+        raw: { mock: true },
+      };
+    }
+
+    if (user.includes('"sources"')) {
+      return {
+        text: JSON.stringify({
+          summary: "Synthesis for gap-analysis compatibility test.",
+          keyFindings: [
+            {
+              id: "F1",
+              text: "Compatibility testing finding grounded in S1.",
+              citations: [{ source: "S1", quoteId: "Q1" }],
+            },
+          ],
+          unknowns: [],
+        }),
+        usage: { inputTokens: 24, outputTokens: 42, costUsd: 0.02 },
+        raw: { mock: true },
+      };
+    }
+
+    throw new Error(`Unhandled gap-analysis-compat mock request: ${user.slice(0, 80)}`);
+  }
+}
+
 describe("orchestrator", () => {
   let container: Awaited<ReturnType<GenericContainer["start"]>> | undefined;
   let store: PostgresStore | undefined;
@@ -1250,7 +1438,7 @@ describe("orchestrator", () => {
       },
     };
 
-    const modelProvider = new MockModelProvider();
+    const modelProvider = new PlanOutlineCompatModelProvider();
 
     await runResearchPipeline({
       runId: run.id,
@@ -1320,6 +1508,12 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
+              },
+              questionGraph: {
+                dependencyInferenceMode: "moderate",
+                pruneStrategy: "transitive_reduction",
+                maxDepth: 4,
               },
               enablePlaywright: false,
             },
@@ -1341,6 +1535,12 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
+              },
+              questionGraph: {
+                dependencyInferenceMode: "moderate",
+                pruneStrategy: "transitive_reduction",
+                maxDepth: 4,
               },
               enablePlaywright: false,
             },
@@ -1372,10 +1572,39 @@ describe("orchestrator", () => {
     const citationMap = await objectStore.getJson<CitationMap>(runCitationMapKey(run.id));
     expect(citationMap?.sources?.length).toBeGreaterThan(0);
 
+    const planArtifact = await objectStore.getJson<{
+      outlinePlan?: { sections?: Array<{ dependsOnQuestionIds?: string[] }> };
+    }>(runPlanKey(run.id));
+    expect(planArtifact?.outlinePlan?.sections?.[0]?.dependsOnQuestionIds).toEqual(["0", "1"]);
+
     const verification = await objectStore.getJson<VerificationReport>(
       runVerificationJsonKey(run.id)
     );
     expect(verification?.version).toBe(1);
+
+    const runModelCalls = await store!.listModelCalls(run.id);
+    const planModelCall = runModelCalls.find(
+      (modelCall) =>
+        modelCall.phase === "plan" &&
+        ((modelCall.params as Record<string, unknown> | null) ?? {}).persona === "plan"
+    );
+    expect(planModelCall).toBeDefined();
+    const planParams = (planModelCall?.params as Record<string, unknown> | null) ?? {};
+    expect(planParams.schemaCompatMode).toBe("plan-outline-shim");
+
+    const runEvents = await store!.listRunEvents(run.id, { limit: 300 });
+    expect(
+      runEvents.some((event) => event.event_type === "phase_started" && event.phase === "report-plan")
+    ).toBe(true);
+    expect(
+      runEvents.some((event) => event.event_type === "phase_started" && event.phase === "synthesize")
+    ).toBe(true);
+
+    const reportPlanArtifact = await objectStore.getJson<{ outlinePlan?: unknown }>(
+      runReportPlanKey(run.id)
+    );
+    expect(reportPlanArtifact).not.toBeNull();
+    expect(reportPlanArtifact?.outlinePlan).toBeDefined();
 
     const client = new pg.Client({ connectionString: store!.databaseUrl });
     await client.connect();
@@ -1518,6 +1747,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -1542,6 +1772,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -1705,6 +1936,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -1726,6 +1958,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -1872,6 +2105,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -1893,6 +2127,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -2082,6 +2317,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -2103,6 +2339,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -2151,7 +2388,7 @@ describe("orchestrator", () => {
     expect(output).toContain("[^S1]");
   }, 60_000);
 
-  it("normalizes low token budgets to the minimum 8,000 before all model calls", async () => {
+  it("normalizes low token budgets to the minimum 20,000 before all model calls", async () => {
     const user = await store!.createUser({ role: "user" });
     const run = await store!.createRun({
       userId: user.id,
@@ -2295,6 +2532,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -2316,6 +2554,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -2361,9 +2600,10 @@ describe("orchestrator", () => {
       .filter((item) => item.phase === "synthesis")
       .map((item) => item.maxTokens);
 
-    expect(sourceAbstractTokens).toContain(8000);
-    expect(reviewTokens).toContain(8000);
-    expect(synthTokens[0]).toBeGreaterThanOrEqual(8000);
+    expect(sourceAbstractTokens).toContain(20_000);
+    expect(reviewTokens).toContain(20_000);
+    expect((synthTokens[0] ?? 0) >= 20_000).toBe(true);
+    expect((synthTokens[0] ?? 0) <= 32_000).toBe(true);
 
     const modelCalls = await store!.listModelCalls(run.id);
     const synthCalls = modelCalls.filter((modelCall) => modelCall.phase === "synthesize");
@@ -2520,6 +2760,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -2541,6 +2782,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -2729,6 +2971,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -2750,6 +2993,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -2946,6 +3190,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -2967,6 +3212,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -3012,7 +3258,8 @@ describe("orchestrator", () => {
     expect(params.reasoningEffort).toBe("high");
     expect(params.synthesisPurpose).toBe("writing");
     expect(typeof params.maxTokens).toBe("number");
-    expect((params.maxTokens as number) >= 8_000).toBe(true);
+    expect((params.maxTokens as number) >= 20_000).toBe(true);
+    expect((params.maxTokens as number) <= 32_000).toBe(true);
     expect(params.effectiveMaxTokens).toBe((params.maxTokens as number));
     expect(params.retryAttempt).toBe(1);
     expect(typeof params.modelCallId).toBe("string");
@@ -3170,6 +3417,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -3191,6 +3439,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -3236,7 +3485,221 @@ describe("orchestrator", () => {
     expect(sourceAbstractParams.synthesisPurpose).toBe("source-abstracts");
     expect(sourceAbstractParams.schemaCompatMode).toBe("legacy-source-abstracts-shim");
     expect(sourceAbstractParams.model).toBe("mock/legacy-compat");
-    expect((sourceAbstractParams.maxTokens as number) >= 8_000).toBe(true);
+    expect(sourceAbstractParams.maxTokens).toBe(20_000);
+  }, 120_000);
+
+  it("coerces synthesis-writing object fields to strings via compatibility shim", async () => {
+    const user = await store!.createUser({ role: "user" });
+    const run = await store!.createRun({
+      userId: user.id,
+      prompt: "Test synthesis-writing object field compatibility.",
+      budgets: {
+        maxRuntimeMs: 60_000,
+        maxSources: 1,
+        maxFetches: 0,
+        maxBrowserRenders: 0,
+        fetchConcurrency: 1,
+        extractConcurrency: 1,
+      },
+      modelConfig: {
+        planner: "mock/planner",
+        synthesizer: "mock/synthesis-writing-compat",
+        verifier: "mock/verify",
+        verifierStrong: "mock/verify-strong",
+      },
+    });
+
+    const objectStore = new FilesystemObjectStore({ rootPath: objectStoreRoot! });
+    const source = await store!.createSource({ runId: run.id, url: "https://example.com/synthesis-compat-source" });
+    const sourceText = "Compatibility source evidence for synthesis-writing schema coercion.";
+    await store!.updateSource({
+      sourceId: source.id,
+      status: "extracted",
+      finalUrl: "https://example.com/synthesis-compat-source",
+      title: "Synthesis Compat Source",
+      publisher: "Example",
+      extractKey: sourceEvidenceKey(run.id, source.id),
+    });
+    await objectStore.putJson(sourceEvidenceKey(run.id, source.id), {
+      contentText: sourceText,
+      metadata: {
+        title: "Synthesis Compat Source",
+        publisher: "Example",
+        authors: [],
+        publishedAt: null,
+      },
+      quotes: [{ text: sourceText, start: 0, end: sourceText.length }],
+      chunks: [{ start: 0, end: sourceText.length, text: sourceText }],
+    });
+    await store!.updateRun({
+      runId: run.id,
+      phase: "synthesize",
+      status: "running",
+      state: {
+        version: 1,
+        nextPhase: "synthesize",
+        counters: { searchCalls: 0, fetches: 0, renders: 0, modelCalls: 0 },
+        artifacts: {},
+        startedAt: new Date().toISOString(),
+        debug: { enabled: false },
+      },
+    });
+
+    const modelProvider = new SynthesisWritingCompatModelProvider();
+
+    await runResearchPipeline({
+      runId: run.id,
+      config: {
+        env: "test",
+        server: { host: "0.0.0.0", port: 0 },
+        worker: {
+          maxConcurrentJobs: 1,
+          pollIntervalMs: 1000,
+          leaseDurationMs: 60_000,
+          heartbeatIntervalMs: 10_000,
+        },
+        postgres: { url: store!.databaseUrl },
+        objectStore: { type: "filesystem", rootPath: objectStoreRoot! },
+        cache: { enabled: false, rootPath: path.join(objectStoreRoot!, "cache"), ttlDays: 1 },
+        debug: { traceTtlDays: 1 },
+        openRouter: {
+          apiKey: undefined,
+          baseUrl: "https://example.invalid",
+          appName: "openresearch",
+          appUrl: undefined,
+        },
+        search: {
+          backend: "searxng",
+          maxResultsPerQuery: 10,
+          searxng: { baseUrl: "http://localhost:8080" },
+          brave: { apiKey: undefined },
+        },
+        models: {
+          planner: "mock/planner",
+          synthesizer: "mock/synthesis-writing-compat",
+          verifier: "mock/verify",
+          verifierStrong: "mock/verify-strong",
+        },
+        budgets: {
+          maxRuntimeMs: 60_000,
+          maxSources: 1,
+          maxFetches: 0,
+          maxBrowserRenders: 0,
+          fetchConcurrency: 1,
+          extractConcurrency: 1,
+        },
+        citationPolicy: "balanced",
+        policies: {
+          defaultUserPolicy: {
+            requestsPerMinute: 60,
+            maxConcurrentJobs: 1,
+            downgradeThreshold: {},
+            braveSearchQuota: 0,
+          },
+          qualityProfiles: {
+            full: {
+              name: "full",
+              searchBackend: "searxng",
+              thinkingMode: "high",
+              models: {
+                planner: "mock/planner",
+                synthesizer: "mock/synthesis-writing-compat",
+                verifier: "mock/verify",
+                verifierStrong: "mock/verify-strong",
+              },
+              budgets: {},
+              enablePlaywright: false,
+              synthesis: { maxInputTokens: 1_000_000, maxOutputTokens: 500_000 },
+              agenticLoop: { maxPlanPasses: 5, maxFollowUpTasksPerPass: 10 },
+              researchLoop: {
+                enabled: false,
+                maxIterations: 5,
+                mode: "auto",
+                switchToHybridAfterRejects: 2,
+                dynamicOutlineEnabled: false,
+              },
+            },
+            degraded: {
+              name: "degraded",
+              searchBackend: "searxng",
+              thinkingMode: "low",
+              models: {
+                planner: "mock/planner",
+                synthesizer: "mock/synthesis-writing-compat",
+                verifier: "mock/verify",
+                verifierStrong: "mock/verify-strong",
+              },
+              budgets: {},
+              enablePlaywright: false,
+              synthesis: { maxInputTokens: 1_000_000, maxOutputTokens: 500_000 },
+              agenticLoop: { maxPlanPasses: 5, maxFollowUpTasksPerPass: 10 },
+              researchLoop: {
+                enabled: false,
+                maxIterations: 5,
+                mode: "auto",
+                switchToHybridAfterRejects: 2,
+                dynamicOutlineEnabled: false,
+              },
+            },
+          },
+        },
+        safety: {
+          allowedDomains: [],
+          deniedDomains: [],
+          userAgent: "openresearch-test",
+          maxContentBytes: 1_000_000,
+        },
+      },
+      services: {
+        store: store!,
+        objectStore,
+        search: {
+          name: "mock-search",
+          async search() {
+            return [];
+          },
+        },
+        httpFetch: {
+          name: "mock-http",
+          async fetch(url: string) {
+            return { ok: false as const, url, status: 500, error: "mock fetch failure" };
+          },
+        },
+        modelProvider,
+      },
+    });
+
+    const finalRun = await store!.getRun(run.id);
+    expect(finalRun?.status).toBe("completed");
+
+    const modelCalls = await store!.listModelCalls(run.id);
+    const writingCall = modelCalls.find(
+      (modelCall) =>
+        modelCall.phase === "synthesize" &&
+        ((modelCall.params as Record<string, unknown> | null) ?? {}).persona === "synthesis-writing"
+    );
+    expect(writingCall).toBeDefined();
+    const writingParams = (writingCall?.params as Record<string, unknown> | null) ?? {};
+    expect(writingParams.schemaCompatMode).toBe("synthesis-writing-stringify-shim");
+
+    const events = await store!.listRunEvents(run.id, { limit: 200 });
+    const writingRetryEvent = events.find(
+      (event) =>
+        event.event_type === "model_call_retry" &&
+        ((event.data as Record<string, unknown> | null) ?? {}).persona === "synthesis-writing"
+    );
+    expect(writingRetryEvent).toBeUndefined();
+
+    const synthesis = await objectStore.getJson<{
+      summary?: unknown;
+      contradictions?: unknown[];
+      recommendations?: unknown[];
+    }>(runSynthesisKey(run.id));
+    expect(typeof synthesis?.summary).toBe("string");
+    expect(typeof synthesis?.contradictions?.[0]).toBe("string");
+    expect(typeof synthesis?.recommendations?.[0]).toBe("string");
+    expect(String(synthesis?.contradictions?.[0] ?? "")).toContain("\"id\":\"C1\"");
+    expect(String(synthesis?.recommendations?.[0] ?? "")).toContain("\"id\":\"R1\"");
   }, 120_000);
 
   it("normalizes sourceAbstracts dataTypes strings into arrays via compatibility shim", async () => {
@@ -3379,6 +3842,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -3400,6 +3864,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -3447,7 +3912,7 @@ describe("orchestrator", () => {
     expect(sourceAbstractParams.synthesisPurpose).toBe("source-abstracts");
     expect(sourceAbstractParams.schemaCompatMode).toBe("legacy-source-abstracts-shim");
     expect(sourceAbstractParams.model).toBe("mock-legacy-compat");
-    expect((sourceAbstractParams.maxTokens as number) >= 8_000).toBe(true);
+    expect(sourceAbstractParams.maxTokens).toBe(20_000);
   }, 120_000);
 
   it("normalizes legacy review payloads with compatible schema shim", async () => {
@@ -3590,6 +4055,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -3611,6 +4077,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -3667,6 +4134,219 @@ describe("orchestrator", () => {
           (event.data as { phase?: string } | null)?.phase === "synthesize"
       )
     ).toBe(true);
+  }, 120_000);
+
+  it("coerces goal-directed gap-analysis payload drift and records schemaCompatMode", async () => {
+    const user = await store!.createUser({ role: "user" });
+    const run = await store!.createRun({
+      userId: user.id,
+      prompt: "Test gap-analysis compatibility shim",
+      budgets: {
+        maxRuntimeMs: 60_000,
+        maxSources: 2,
+        maxFetches: 1,
+        maxBrowserRenders: 0,
+        fetchConcurrency: 1,
+        extractConcurrency: 1,
+      },
+      modelConfig: {
+        planner: "mock/gap-analysis-compat",
+        synthesizer: "mock/gap-analysis-compat",
+        verifier: "mock/gap-analysis-compat",
+        verifierStrong: "mock/gap-analysis-compat",
+      },
+    });
+
+    const objectStore = new FilesystemObjectStore({ rootPath: objectStoreRoot! });
+    const source = await store!.createSource({
+      runId: run.id,
+      url: "https://example.com/gap-compat-source",
+    });
+    await store!.updateSource({
+      sourceId: source.id,
+      status: "extracted",
+      finalUrl: "https://example.com/gap-compat-source",
+      title: "Gap Compat Source",
+      publisher: "Example",
+      extractKey: sourceEvidenceKey(run.id, source.id),
+    });
+    await objectStore.putJson(sourceEvidenceKey(run.id, source.id), {
+      contentText: "Gap-analysis compatibility evidence content for q1.",
+      metadata: {
+        title: "Gap Compat Source",
+        publisher: "Example",
+        authors: [],
+        publishedAt: null,
+      },
+      quotes: [
+        {
+          text: "Gap-analysis compatibility evidence content for q1.",
+          start: 0,
+          end: 50,
+        },
+      ],
+      chunks: [
+        {
+          start: 0,
+          end: 50,
+          text: "Gap-analysis compatibility evidence content for q1.",
+        },
+      ],
+    });
+
+    await objectStore.putJson(runPlanKey(run.id), {
+      subquestions: ["What is the compatibility result?"],
+      queries: ["compatibility shim test query"],
+    });
+
+    await store!.updateRun({
+      runId: run.id,
+      state: {
+        version: 1,
+        nextPhase: "retrieve",
+        counters: { searchCalls: 0, fetches: 0, renders: 0, modelCalls: 0 },
+        artifacts: { planKey: runPlanKey(run.id) },
+        startedAt: new Date().toISOString(),
+        debug: { enabled: false },
+      },
+    });
+
+    await runResearchPipeline({
+      runId: run.id,
+      config: {
+        env: "test",
+        server: { host: "0.0.0.0", port: 0 },
+        worker: {
+          maxConcurrentJobs: 1,
+          pollIntervalMs: 1000,
+          leaseDurationMs: 60_000,
+          heartbeatIntervalMs: 10_000,
+        },
+        postgres: { url: store!.databaseUrl },
+        objectStore: { type: "filesystem", rootPath: objectStoreRoot! },
+        cache: { enabled: false, rootPath: path.join(objectStoreRoot!, "cache"), ttlDays: 1 },
+        debug: { traceTtlDays: 1 },
+        openRouter: {
+          apiKey: undefined,
+          baseUrl: "https://example.invalid",
+          appName: "openresearch",
+          appUrl: undefined,
+        },
+        search: {
+          backend: "searxng",
+          maxResultsPerQuery: 10,
+          searxng: { baseUrl: "http://localhost:8080" },
+          brave: { apiKey: undefined },
+        },
+        models: {
+          planner: "mock/gap-analysis-compat",
+          synthesizer: "mock/gap-analysis-compat",
+          verifier: "mock/gap-analysis-compat",
+          verifierStrong: "mock/gap-analysis-compat",
+        },
+        budgets: {
+          maxRuntimeMs: 60_000,
+          maxSources: 2,
+          maxFetches: 1,
+          maxBrowserRenders: 0,
+          fetchConcurrency: 1,
+          extractConcurrency: 1,
+        },
+        citationPolicy: "balanced",
+        policies: {
+          defaultUserPolicy: {
+            requestsPerMinute: 60,
+            maxConcurrentJobs: 1,
+            downgradeThreshold: {},
+            braveSearchQuota: 0,
+          },
+          qualityProfiles: {
+            full: {
+              name: "full",
+              searchBackend: "searxng",
+              thinkingMode: "high",
+              models: {
+                planner: "mock/gap-analysis-compat",
+                synthesizer: "mock/gap-analysis-compat",
+                verifier: "mock/gap-analysis-compat",
+                verifierStrong: "mock/gap-analysis-compat",
+              },
+              budgets: {},
+              enablePlaywright: false,
+              synthesis: { maxInputTokens: 1_000_000, maxOutputTokens: 500_000 },
+              agenticLoop: { maxPlanPasses: 1, maxFollowUpTasksPerPass: 10 },
+              researchLoop: {
+                enabled: true,
+                maxIterations: 2,
+                mode: "auto",
+                switchToHybridAfterRejects: 2,
+                dynamicOutlineEnabled: true,
+              },
+            },
+            degraded: {
+              name: "degraded",
+              searchBackend: "searxng",
+              thinkingMode: "low",
+              models: {
+                planner: "mock/gap-analysis-compat",
+                synthesizer: "mock/gap-analysis-compat",
+                verifier: "mock/gap-analysis-compat",
+                verifierStrong: "mock/gap-analysis-compat",
+              },
+              budgets: {},
+              enablePlaywright: false,
+              synthesis: { maxInputTokens: 1_000_000, maxOutputTokens: 500_000 },
+              agenticLoop: { maxPlanPasses: 5, maxFollowUpTasksPerPass: 10 },
+              researchLoop: {
+                enabled: true,
+                maxIterations: 2,
+                mode: "auto",
+                switchToHybridAfterRejects: 2,
+                dynamicOutlineEnabled: true,
+              },
+            },
+          },
+        },
+        safety: {
+          allowedDomains: [],
+          deniedDomains: [],
+          userAgent: "openresearch-test",
+          maxContentBytes: 1_000_000,
+        },
+      },
+      services: {
+        store: store!,
+        objectStore,
+        search: {
+          name: "mock-search",
+          async search() {
+            return [];
+          },
+        },
+        httpFetch: {
+          name: "mock-http",
+          async fetch(url: string) {
+            return { ok: false as const, url, status: 500, error: "mock fetch failure" };
+          },
+        },
+        modelProvider: new GapAnalysisCompatModelProvider(),
+      },
+    });
+
+    const finalRun = await store!.getRun(run.id);
+    expect(finalRun?.status).toBe("completed");
+
+    const modelCalls = await store!.listModelCalls(run.id);
+    const gapCall = modelCalls.find(
+      (modelCall) =>
+        modelCall.phase === "gap-analysis" &&
+        ((modelCall.params as Record<string, unknown> | null) ?? {}).persona ===
+          "goal-directed-gap-analysis"
+    );
+    expect(gapCall).toBeDefined();
+
+    const gapParams = (gapCall?.params as Record<string, unknown> | null) ?? {};
+    expect(gapParams.schemaCompatMode).toBe("gap-analysis-shim");
   }, 120_000);
 
   it("runs synthesis review loop and records reviewer-guided refinement", async () => {
@@ -3872,6 +4552,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -3893,6 +4574,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -4104,6 +4786,7 @@ describe("orchestrator", () => {
                   maxIterations: 5,
                   mode: "auto",
                   switchToHybridAfterRejects: 2,
+                dynamicOutlineEnabled: false,
                 },
               },
               degraded: {
@@ -4128,6 +4811,7 @@ describe("orchestrator", () => {
                   maxIterations: 5,
                   mode: "auto",
                   switchToHybridAfterRejects: 2,
+                dynamicOutlineEnabled: false,
                 },
               },
             },
@@ -4328,6 +5012,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -4349,6 +5034,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -4542,6 +5228,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -4563,6 +5250,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -4734,6 +5422,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -4755,6 +5444,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -4928,6 +5618,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -4949,6 +5640,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -4986,7 +5678,7 @@ describe("orchestrator", () => {
     expect(output).toContain("Summary based on sources after retries.");
   }, 60_000);
 
-  it("fails synthesis when refinement attempts are exhausted before sufficient output", async () => {
+  it("completes with best-effort synthesis when refinement attempts are exhausted", async () => {
     const user = await store!.createUser({ role: "user" });
     const run = await store!.createRun({
       userId: user.id,
@@ -5153,6 +5845,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
             degraded: {
@@ -5174,6 +5867,7 @@ describe("orchestrator", () => {
                 maxIterations: 5,
                 mode: "auto",
                 switchToHybridAfterRejects: 2,
+              dynamicOutlineEnabled: false,
               },
             },
           },
@@ -5205,30 +5899,23 @@ describe("orchestrator", () => {
     });
 
     const finalRun = await store!.getRun(run.id);
-    expect(finalRun?.status).toBe("failed");
-    expect(finalRun?.phase).toBe("synthesize");
-    const errorMessage =
-      finalRun?.error && typeof finalRun.error === "object" && "message" in finalRun.error
-        ? String((finalRun.error as { message?: unknown }).message)
-        : String(finalRun?.error ?? "");
-    expect(errorMessage).toContain(
-      "Synthesis could not reach requested depth after refinement loop."
-    );
+    expect(finalRun?.status).toBe("completed");
+    expect(finalRun?.error).toBeNull();
 
-    expect(modelProvider.synthCallCount).toBeGreaterThanOrEqual(4);
-    expect(modelProvider.reviewCallCount).toBeGreaterThanOrEqual(4);
+    expect(modelProvider.synthCallCount).toBeGreaterThanOrEqual(3);
+    expect(modelProvider.reviewCallCount).toBeGreaterThanOrEqual(3);
 
     const events = await store!.listRunEvents(run.id, { limit: 300 });
-    expect(
-      events.find((event) => event.event_type === "synthesis_refinement_exhausted")
-    ).toBeDefined();
+    const exhaustedEvent = events.find((event) => event.event_type === "synthesis_refinement_exhausted");
+    expect(exhaustedEvent).toBeDefined();
+    expect(exhaustedEvent?.level).toBe("info");
     expect(events.find((event) => event.event_type === "synthesis_review_feedback")).toBeDefined();
     expect(events.find((event) => event.event_type === "synthesis_review_requested")).toBeDefined();
     expect(
       events.find((event) => event.event_type === "phase_started" && event.phase === "verify")
-    ).toBeUndefined();
+    ).toBeDefined();
 
-    expect(await objectStore.getText(runOutputKey(run.id))).toBeNull();
-    expect(await objectStore.getText(runVerificationMarkdownKey(run.id))).toBeNull();
+    expect(await objectStore.getText(runOutputKey(run.id))).not.toBeNull();
+    expect(await objectStore.getText(runVerificationMarkdownKey(run.id))).not.toBeNull();
   }, 60_000);
 });

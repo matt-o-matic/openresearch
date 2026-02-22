@@ -23,7 +23,7 @@ describe("goal-directed", () => {
     expect(out.questions[1]?.dependsOn).toEqual(["q1"]);
   });
 
-  it("falls back to a flat list when dependencies reference missing ids", () => {
+  it("drops dependencies that reference missing ids", () => {
     const graph = QuestionGraphSchema.parse({
       validated: false,
       questions: [{ id: "q1", text: "One", dependsOn: ["q999"], status: "unanswered", evidence: [] }],
@@ -34,7 +34,7 @@ describe("goal-directed", () => {
     expect(out.questions[0]?.dependsOn).toEqual([]);
   });
 
-  it("falls back to a flat list when ids are duplicated", () => {
+  it("renames duplicated ids and preserves valid dependencies", () => {
     const graph = QuestionGraphSchema.parse({
       validated: false,
       questions: [
@@ -45,10 +45,11 @@ describe("goal-directed", () => {
 
     const out = validateQuestionGraph(graph);
     expect(out.validated).toBe(false);
-    expect(out.questions.every((q) => q.dependsOn.length === 0)).toBe(true);
+    expect(out.questions.map((q) => q.id)).toEqual(["q1", "q2"]);
+    expect(out.questions[1]?.dependsOn).toEqual(["q1"]);
   });
 
-  it("falls back to a flat list when cycles are present", () => {
+  it("breaks cycles by dropping minimal edges", () => {
     const graph = QuestionGraphSchema.parse({
       validated: false,
       questions: [
@@ -59,7 +60,8 @@ describe("goal-directed", () => {
 
     const out = validateQuestionGraph(graph);
     expect(out.validated).toBe(false);
-    expect(out.questions.every((q) => q.dependsOn.length === 0)).toBe(true);
+    expect(out.questions[0]?.dependsOn).toEqual(["q2"]);
+    expect(out.questions[1]?.dependsOn).toEqual([]);
   });
 
   it("computes unblocked questions based on answered dependencies", () => {
@@ -96,4 +98,3 @@ describe("goal-directed", () => {
     expect(keepsAnswered.status).toBe("answered");
   });
 });
-

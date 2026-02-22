@@ -15,6 +15,7 @@ function isPipelinePhase(value: unknown): value is PipelinePhase {
   return (
     value === "plan" ||
     value === "retrieve" ||
+    value === "report-plan" ||
     value === "fetch" ||
     value === "extract" ||
     value === "synthesize" ||
@@ -67,4 +68,3 @@ export async function restoreRunStateFromLatestCheckpoint(input: {
     iterationCompleted: parsedRow.data.iteration_completed ?? null,
   };
 }
-
